@@ -13,6 +13,7 @@ ifneq (,$(shell which git 2> /dev/null))
 endif
 
 # Evaluate parameters
+TLP_LBIN 	?= /usr/local/bin
 TLP_SBIN    ?= /usr/sbin
 TLP_BIN     ?= /usr/bin
 TLP_TLIB    ?= /usr/share/tlp
@@ -41,6 +42,7 @@ TLP_RUN     ?= /run/tlp
 TLP_VAR     ?= /var/lib/tlp
 
 # Catenate DESTDIR to paths
+_LBIN	 = $(DESTDIR)$(TLP_LBIN)
 _SBIN    = $(DESTDIR)$(TLP_SBIN)
 _BIN     = $(DESTDIR)$(TLP_BIN)
 _TLIB    = $(DESTDIR)$(TLP_TLIB)
@@ -90,6 +92,7 @@ INFILES = \
 	tlp-func-base \
 	tlp-psd \
 	tlp-psd.service \
+	tlp-psd.upstart \
 	tlp-rdw-nm \
 	tlp-rdw.rules \
 	tlp-rdw-udev \
@@ -165,7 +168,7 @@ clean:
 install-tlp: all
 	# Package tlp
 	install -D -m 755 tlp $(_SBIN)/tlp
-	install -D -m 755 tlp-psd $(_TLIB)/tlp-psd
+	install -D -m 755 tlp-psd $(_BIN)/tlp-psd
 	install -D -m 755 tlp-rf $(_BIN)/bluetooth
 	ln -sf bluetooth $(_BIN)/nfc
 	ln -sf bluetooth $(_BIN)/wifi
@@ -244,7 +247,9 @@ ifneq ($(TLP_NO_FISHCOMP),1)
 	install -D -m 644 completion/fish/tlp-rdw.fish $(_FISHCPL)/tlp-rdw.fish
 endif
 
-
+install-scx:
+	# Package scx_p2dq scheduler (pre-compiled)
+	install -D -m 755 scx/target/release/scx_p2dq $(_LBIN)/scx_p2dq
 
 install-man-tlp:
 	# manpages
@@ -259,14 +264,14 @@ install-man-rdw:
 	cd man-rdw && install -m 644 $(MANFILESRDW8) $(_MAN)/man8/
 
 
-install: install-tlp install-rdw
+install: install-tlp install-rdw install-scx
 
 install-man: install-man-tlp install-man-rdw
 
 uninstall-tlp:
 	# Package tlp
 	rm $(_SBIN)/tlp
-	rm $(_TLIB)/tlp-psd
+	rm $(_BIN)/tlp-psd
 	rm $(_BIN)/bluetooth
 	rm $(_BIN)/nfc
 	rm $(_BIN)/wifi
@@ -305,7 +310,8 @@ uninstall-tlp:
 	rm -f $(_FISHCPL)/run-on-ac.fish
 	rm -f $(_FISHCPL)/run-on-bat.fish
 	rm -f $(_META)/de.linrunner.tlp.metainfo.xml
-	rm -r $(_VAR)
+	# Note: $(_VAR) directory is intentionally NOT deleted to preserve daemon state (psd-state.conf)
+	# This allows the learned parameters to survive uninstall/reinstall cycles
 
 uninstall-rdw:
 	# Package tlp-rdw
@@ -317,6 +323,9 @@ uninstall-rdw:
 	rm -f $(_ZSHCPL)/_tlp-rdw
 	rm -f $(_FISHCPL)/tlp-rdw.fish
 
+uninstall-scx:
+	# Package scx_p2dq scheduler
+	rm -f $(_LBIN)/scx_p2dq
 
 uninstall-man-tlp:
 	# manpages
@@ -328,7 +337,7 @@ uninstall-man-rdw:
 	cd $(_MAN)/man8 && rm -f $(MANFILESRDW8)
 
 
-uninstall: uninstall-tlp uninstall-rdw
+uninstall: uninstall-tlp uninstall-rdw uninstall-scx
 
 uninstall-man: uninstall-man-tlp uninstall-man-rdw
 

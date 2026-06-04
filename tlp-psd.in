@@ -1,13 +1,14 @@
 #!/bin/sh
 # tlp-psd - Workload-dependent profile switching (SAV/BAL/PRF)
-#
 # Automatically switches between SAV, BAL, and PRF profiles based on workload.
-# Uses the same lag detection algorithm and configuration as the dyn-saver.
 #
-# Copyright (c) 2026 Mario Herrmann <marioherrmann at posteo.de> and others.
+# +++ 1.10.5 --- 04.06.2026 +++
+#
+# Copyright (c) 2026 Mario Herrmann <marioherrmann at posteo.de>.
 # SPDX-License-Identifier: GPL-2.0-or-later
-
+#
 # Requires: tlp-func-base, tlp-func-cpu
+# shellcheck disable=SC1090,SC2034,SC2043,SC2046,SC2153,SC2154,SC2188,SC2235,SC2269
 
 # Helper functions
 
@@ -21,6 +22,47 @@ remove_pidfile() {
     rm -f "$RUNDIR/tlp-psd.pid" 2>/dev/null || true
 }
 
+# ===== IN-MEMORY CACHE FOR STATE FILES =====
+# These variables store file contents in RAM to minimize disk I/O
+psd_state_cache=""
+candidates_cache=""
+psd_state_loaded=0
+candidates_cache_loaded=0
+
+reload_cache() {
+    # Reload both caches from disk (useful for SIGHUP or external updates)
+    # Allows external tools to update state files without daemon restart
+    echo_debug "power-saver" "CACHE RELOAD triggered (external state files may have changed)"
+    
+    # Force reload: read both files fresh from disk
+    if [ -f "/var/lib/tlp/psd-state.conf" ]; then
+        psd_state_cache=$(cat /var/lib/tlp/psd-state.conf 2>/dev/null)
+        psd_state_loaded=1
+        echo_debug "power-saver" "RELOAD: psd-state.conf reloaded from disk"
+    fi
+    
+    if [ -f "/var/lib/tlp/candidates.conf" ]; then
+        candidates_cache=$(cat /var/lib/tlp/candidates.conf 2>/dev/null)
+        candidates_cache_loaded=1
+        candidates_list="$candidates_cache"
+        echo_debug "power-saver" "RELOAD: candidates.conf reloaded from disk"
+    fi
+    
+    # Re-parse cache to reload shell variables
+    load_psd_state
+}
+
+# Signal handlers for graceful reloads
+handle_sighup() {
+    echo_debug "power-saver" "Received SIGHUP: reloading state caches"
+    reload_cache
+}
+
+handle_sigusr1() {
+    echo_debug "power-saver" "Received SIGUSR1: forcing cache sync to disk"
+    save_psd_state
+}
+
 is_running() {
     [ -f "$RUNDIR/tlp-psd.pid" ] || return 1
     pid=$(cat "$RUNDIR/tlp-psd.pid")
@@ -29,96 +71,122 @@ is_running() {
 }
 
 get_lag_score() {
-    # Calculate lag indicator using snapshot caching in temporary file
-    # Returns a "lag score" 0-100 where lag score influences profile switching:
+    # Calculates a system lag indicator (0-100) using POSIX-compliant shell logic.
+    # Compatible with /bin/sh (dash, bash, zsh, ksh).
+    # Returns a score influencing profile switching:
     #   0-25:  Low lag (idle/light load) → switch to SAV profile
     #  25-75:  Medium lag (normal work) → stay at BAL profile
     #  75-100: High lag (heavy load) → switch to PRF profile
-    #
-    # OPTIMIZATION: Uses file-based snapshot cache - 0% measurement overhead!
-    # Reads current /proc/stat and compares with cached previous snapshot
     
     local cache_file="/run/tlp/profile_lag_snapshot"
     mkdir -p /run/tlp 2>/dev/null
     
-    # Read CURRENT snapshot (instantaneous, no sleep!)
-    set -- $(head -1 /proc/stat)
-    shift  # skip "cpu" label
+    # Read CURRENT CPU snapshot
+    if [ -f /proc/stat ]; then
+        local cpu_line
+        read -r cpu_line < /proc/stat 2>/dev/null
+        # shellcheck disable=2086
+        set -- $cpu_line
+        shift # Discard the "cpu" label
+    else
+        echo 0
+        return
+    fi
     
-    local cpu_total=0 current_idle=$4 current_iowait=$5
-    for val in "$@"; do cpu_total=$((cpu_total + val)); done
+    # Assign values (POSIX standard: after shift, $1=user, $4=idle, $5=iowait)
+    local current_idle="$4"
+    local current_iowait="$5"
     
-    # Read CACHED previous snapshot (or create if missing)
+    local cpu_total=0
+    for val in "$@"; do
+        cpu_total=$((cpu_total + val))
+    done
+    
+    # Read CACHED previous snapshot from file
+    local last_cpu_time=0 last_idle=0 last_iowait=0
     if [ -f "$cache_file" ]; then
-        read last_cpu_time last_idle last_iowait < "$cache_file" 2>/dev/null
+        read -r last_cpu_time last_idle last_iowait < "$cache_file" 2>/dev/null
     fi
     [ -z "$last_cpu_time" ] && last_cpu_time=0
     [ -z "$last_idle" ] && last_idle=0
     [ -z "$last_iowait" ] && last_iowait=0
     
-    # Save current snapshot for next call
+    # Save the current snapshot for the next execution interval
     echo "$cpu_total $current_idle $current_iowait" > "$cache_file" 2>/dev/null
     
-    # Calculate deltas since last snapshot
+    # Calculate deltas since the last snapshot
     local cpu_delta=$((cpu_total - last_cpu_time))
     local idle_delta=$((current_idle - last_idle))
     local iowait_delta=$((current_iowait - last_iowait))
     
-    # Handle edge cases (first run or negative deltas from overflow)
+    # Handle first run or negative deltas from counter overflow
     if [ "$cpu_delta" -le 0 ]; then
         echo 0
         return
     fi
     
-    # Calculate CPU utilization percentage
-    local busy_delta=$((cpu_delta - idle_delta))
+    # Calculate CPU utilization percentage (Fix: subtract iowait from busy time!)
+    local busy_delta=$((cpu_delta - idle_delta - iowait_delta))
     local cpu_pct=$((busy_delta * 100 / cpu_delta))
     
-    # Calculate I/O-Wait percentage (separate metric for blocking)
+    # Calculate I/O-Wait percentage
     local iowait_pct=$((iowait_delta * 100 / cpu_delta))
     
-    # Convert metrics to lag_score (0-100)
-    # Base: CPU pct mapping
-    # Bonus: I/O-Wait contribution (indicates blocking, responsive lag)
-    
+    # Map CPU percentage to base lag score
     local lag_score=0
-    
     if [ "$cpu_pct" -lt 40 ]; then
-        lag_score=$((cpu_pct / 2))  # 0-20 points
+        lag_score=$((cpu_pct / 2))
     elif [ "$cpu_pct" -lt 70 ]; then
-        lag_score=$((20 + (cpu_pct - 40) * 4 / 3))  # 20-60 points
+        lag_score=$((20 + (cpu_pct - 40) * 4 / 3))
     elif [ "$cpu_pct" -lt 95 ]; then
-        lag_score=$((60 + (cpu_pct - 70) * 4 / 3))  # 60-95 points
+        lag_score=$((60 + (cpu_pct - 70) * 4 / 3))
     else
-        lag_score=$((95 + (cpu_pct - 95)))  # 95-100 points
+        lag_score=$((95 + (cpu_pct - 95)))
     fi
     
-    # ADD I/O-Wait contribution (indicates blocking, not just computation)
-    # I/O-Wait > 10% = significant blocking
-    # I/O-Wait > 30% = severe blocking (responsive lag!)
+    # Add I/O-Wait contribution (indicates blocking responsive lag)
     if [ "$iowait_pct" -gt 10 ]; then
-        iowait_contribution=$((iowait_pct / 2))  # 5-15% I/O = 2.5-7.5 bonus points
+        local iowait_contribution=$((iowait_pct / 2))
         lag_score=$((lag_score + iowait_contribution))
     fi
     
-    # OPTIONAL: Load Average supplement (detect process queueing)
-    local num_cpus=$(nproc 2>/dev/null || echo 4)
+    # Load Average supplement (detect active process queueing)
+    local num_cpus
+    num_cpus=$(nproc 2>/dev/null || echo 4)
+
     if [ "$lag_score" -gt 50 ] && [ -f /proc/loadavg ]; then
-        read load_1min load_5min load_rest < /proc/loadavg 2>/dev/null
+        local load_1min load_rest load_before_dot load_after_dot load_int
+        read -r load_1min load_rest < /proc/loadavg 2>/dev/null
+
+        case "$load_1min" in
+            *.*) ;;
+            *) load_1min="${load_1min}.00" ;;
+        esac    
+        
         if [ -n "$load_1min" ]; then
-            load_int="${load_1min%.*}"
-            [ -z "$load_int" ] && load_int=0
+            # POSIX string replacement: Split string by the dot
+            load_before_dot="${load_1min%.*}"
+            load_after_dot="${load_1min#*.}"
+            load_int="${load_before_dot}${load_after_dot}"
             
-            excess_load=$((load_int - num_cpus))
+            # POSIX-compliant loop to strip leading zeroes (avoids octal math errors)
+            while [ "${#load_int}" -gt 1 ] && [ "${load_int%"${load_int#?}"}" = "0" ]; do
+                load_int="${load_int#0}"
+            done
+            load_int=$((load_int)) # Safe integer casting
+            
+            local cpus_scaled=$((num_cpus * 100))
+            local excess_load=$((load_int - cpus_scaled))
+            
             if [ "$excess_load" -gt 0 ]; then
-                load_bonus=$((excess_load * 3))
+                local load_bonus=$((excess_load * 3 / 100))
                 [ "$load_bonus" -gt 15 ] && load_bonus=15
                 lag_score=$((lag_score + load_bonus))
             fi
         fi
     fi
     
-    # Cap lag_score at 100
+    # Clamp final lag_score to 0-100 range
     [ "$lag_score" -gt 100 ] && lag_score=100
     [ "$lag_score" -lt 0 ] && lag_score=0
     
@@ -145,15 +213,11 @@ get_pm_qos_requirement() {
     
     # Read the constraint value (little-endian 32-bit unsigned int)
     # od outputs: "   constraint_value"
-    local constraint
-    constraint=$(od -An -tu4 -N4 "$pmqos_file" 2>/dev/null | xargs 2>/dev/null)
-    
-    if [ -z "$constraint" ] || [ "$constraint" = "0" ]; then
-        # No constraint or uninitialized = not in use
-        echo -1
-        return 0
+    local constraint_raw
+    if constraint_raw=$(od -An -tu4 -N4 "$pmqos_file" 2>/dev/null); then
+        constraint=$((constraint_raw))
     fi
-    
+
     # Map latency constraint to lag_score
     # Heuristic: lower latency = higher performance demand
     if [ "$constraint" -gt 100000 ]; then
@@ -197,7 +261,14 @@ get_battery_capacity() {
     local bat_dir capacity
     
     # Standard capacity file
-    bat_dir=$(ls -d /sys/class/power_supply/BAT* 2>/dev/null | head -1)
+    local bat_dir=""
+    for d in /sys/class/power_supply/BAT*; do
+        if [ -d "$d" ]; then
+            bat_dir="$d"
+            break
+        fi
+    done
+
     if [ -n "$bat_dir" ] && [ -f "$bat_dir/capacity" ]; then
         capacity=$(cat "$bat_dir/capacity" 2>/dev/null)
         if [ -n "$capacity" ] && [ "$capacity" -ge 0 ] && [ "$capacity" -le 100 ]; then
@@ -209,6 +280,335 @@ get_battery_capacity() {
     # Unavailable
     echo -1
     return 0
+}
+
+get_battery_charge_mah() {
+    # Read current battery charge in milliamp-hours (mAh)
+    # Returns: mAh value or -1 if unavailable
+    # This enables accurate energy consumption tracking: Wh = (mAh_diff / 1000) * voltage
+    
+    local bat_dir charge
+    
+    local bat_dir=""
+    for d in /sys/class/power_supply/BAT*; do
+        if [ -d "$d" ]; then
+            bat_dir="$d"
+            break
+        fi
+    done
+
+    if [ -n "$bat_dir" ] && [ -f "$bat_dir/charge_now" ]; then
+        charge=$(cat "$bat_dir/charge_now" 2>/dev/null)
+        if [ -n "$charge" ] && [ "$charge" -ge 0 ]; then
+            # Convert µAh to mAh (divide by 1000)
+            echo "$((charge / 1000))"
+            return 0
+        fi
+    fi
+    
+    # Fallback: try energy_now / voltage if charge not available
+    if [ -n "$bat_dir" ] && [ -f "$bat_dir/energy_now" ] && [ -f "$bat_dir/voltage_now" ]; then
+        local energy voltage
+        energy=$(cat "$bat_dir/energy_now" 2>/dev/null)
+        voltage=$(cat "$bat_dir/voltage_now" 2>/dev/null)
+        if [ -n "$energy" ] && [ -n "$voltage" ] && [ "$voltage" -gt 0 ]; then
+            # energy (µWh) / voltage (µV) = charge (mAh)
+            # shellcheck disable=SC2017
+            echo "$((energy / voltage * 1000))"
+            return 0
+        fi
+    fi
+    
+    echo -1
+}
+
+get_battery_charge_full_mah() {
+    # Read battery full charge capacity in mAh
+    # Used to set baseline/fullcharge reference point
+    
+    local bat_dir charge_full
+    
+    local bat_dir=""
+    for d in /sys/class/power_supply/BAT*; do
+        if [ -d "$d" ]; then
+            bat_dir="$d"
+            break
+        fi
+    done
+
+    if [ -n "$bat_dir" ] && [ -f "$bat_dir/charge_full" ]; then
+        charge_full=$(cat "$bat_dir/charge_full" 2>/dev/null)
+        if [ -n "$charge_full" ] && [ "$charge_full" -ge 0 ]; then
+            echo "$((charge_full / 1000))"
+            return 0
+        fi
+    fi
+    
+    echo -1
+}
+
+get_battery_voltage_mv() {
+    # Read battery voltage in millivolts
+    # Needed for Wh calculation: Wh = (mAh * mV) / 1,000,000
+    
+    local bat_dir voltage
+    
+    local bat_dir=""
+    for d in /sys/class/power_supply/BAT*; do
+        if [ -d "$d" ]; then
+            bat_dir="$d"
+            break
+        fi
+    done
+    
+    if [ -n "$bat_dir" ] && [ -f "$bat_dir/voltage_now" ]; then
+        voltage=$(cat "$bat_dir/voltage_now" 2>/dev/null)
+        if [ -n "$voltage" ] && [ "$voltage" -ge 0 ]; then
+            # Convert µV to mV (divide by 1000)
+            echo "$((voltage / 1000))"
+            return 0
+        fi
+    fi
+    
+    # Fallback: typical laptop battery voltage ~12V
+    echo 12000
+}
+
+format_energy_value() {
+    # Format energy value with appropriate unit (Wh or mWh)
+    # If >= 0.01 Wh: display in Wh with 2 decimals (e.g., "2.24 Wh")
+    # If < 0.01 Wh: display in mWh with 2 decimals (e.g., "4.18 mWh")
+    
+    local wh="$1"
+    
+    if [ -z "$wh" ] || [ "$(echo "$wh <= 0" | bc 2>/dev/null || echo "0")" -eq 1 ]; then
+        echo "0.00 Wh"
+        return 0
+    fi
+    
+    # Check if >= 0.01 Wh; if so, use Wh unit
+    if [ "$(echo "$wh >= 0.01" | bc 2>/dev/null || echo "0")" -eq 1 ]; then
+        printf "%.2f Wh" "$wh"
+    else
+        # Convert to mWh (1 Wh = 1000 mWh) with 2 decimals
+        local mwh
+        mwh=$(echo "scale=2; $wh * 1000" | bc -l 2>/dev/null || echo "0.00")
+        printf "%.2f mWh" "$mwh"
+    fi
+}
+
+format_duration() {
+    # Format duration in seconds to human-readable format
+    # Input: $1 = seconds (integer)
+    # Output: "X days Y hours Z minutes A seconds" (omits zero units)
+    # Example: 90061 -> "1 day 1 hour 1 minute 1 second"
+    
+    local total_seconds="$1"
+    local days hours minutes seconds
+    
+    if [ -z "$total_seconds" ] || [ "$total_seconds" -lt 0 ]; then
+        echo "0 seconds"
+        return 0
+    fi
+    
+    days=$((total_seconds / 86400))
+    hours=$(((total_seconds % 86400) / 3600))
+    minutes=$(((total_seconds % 3600) / 60))
+    seconds=$((total_seconds % 60))
+    
+    local result=""
+    
+    [ "$days" -gt 0 ] && result="$result $days day$([ "$days" -eq 1 ] || echo "s")"
+    [ "$hours" -gt 0 ] && result="$result $hours hour$([ "$hours" -eq 1 ] || echo "s")"
+    [ "$minutes" -gt 0 ] && result="$result $minutes minute$([ "$minutes" -eq 1 ] || echo "s")"
+    [ "$seconds" -gt 0 ] && result="$result $seconds second$([ "$seconds" -eq 1 ] || echo "s")"
+    
+    # If total_seconds is 0, return "0 seconds"
+    [ -z "$result" ] && result=" 0 seconds"
+    
+    echo "$result" | sed 's/^ //'
+}
+
+calculate_energy_from_charge_diff() {
+    # Calculate energy consumption in Wh from charge difference
+    # Parameters: $1 = charge_diff_mah (can be decimal from bc), $2 = voltage_mv (optional, defaults to current)
+    # Returns: Wh (with 6 decimal precision for internal accuracy, limited rounding only at display)
+    
+    local charge_diff_mah="$1"
+    local voltage_mv="${2:-$(get_battery_voltage_mv)}"
+    
+    if [ -z "$charge_diff_mah" ] || [ "$(echo "$charge_diff_mah <= 0" | bc 2>/dev/null || echo "0")" -eq 1 ]; then
+        echo "0.000000"
+        return 0
+    fi
+    
+    # Use bc for full precision decimal arithmetic with 6 decimals
+    # Wh = (mAh * mV) / 1,000,000 
+    # Keep 6 decimals internally for accuracy (only round to 2 at display time)
+    echo "scale=6; $charge_diff_mah * $voltage_mv / 1000000" | bc -l 2>/dev/null || echo "0.000000"
+}
+
+update_cumulative_energy() {
+    # Update cumulative energy consumption by checking battery charge vs last snapshot
+    # Called from main loop before save_psd_state() to persist updated values
+    # This ensures cumulative values grow with each status check
+    
+    # Initialize snapshot if not yet set (first daemon run)
+    if [ -z "$last_snapshot_timestamp" ] || [ "$last_snapshot_timestamp" -eq 0 ]; then
+        last_snapshot_timestamp=$(date +%s)
+        last_snapshot_charge_mah=$(get_battery_charge_mah)
+        last_snapshot_voltage_mv=$(get_battery_voltage_mv)
+        echo_debug "power-saver" "Energy snapshot init: charge=$last_snapshot_charge_mah mAh, voltage=$last_snapshot_voltage_mv mV"
+        return 0
+    fi
+    
+    # Initialize cumulative values with defaults if not set (6 decimals for internal precision)
+    cumulative_energy_sav_wh=${cumulative_energy_sav_wh:-0.000000}
+    cumulative_energy_bal_wh=${cumulative_energy_bal_wh:-0.000000}
+    cumulative_energy_prf_wh=${cumulative_energy_prf_wh:-0.000000}
+    
+    # Calculate energy consumed since last measured state
+    local current_charge_mah
+    current_charge_mah=$(get_battery_charge_mah)
+    
+    # Check if battery is charging (current > snapshot)
+    # If so: complete the LAST discharge cycle before resetting snapshot
+    if [ "$current_charge_mah" -gt "$last_snapshot_charge_mah" ]; then
+        # Battery has been charged - snapshot was from BEFORE charging
+        # Calculate final energy from last snapshot up until charging started
+        # (we can't know exactly when charging started, so we use current charge as estimate)
+        # For safety: we just ignore the charging period and restart tracking
+        
+        last_snapshot_charge_mah=$current_charge_mah
+        last_snapshot_voltage_mv=$(get_battery_voltage_mv)
+        last_snapshot_timestamp=$(date +%s)  # Update timestamp for fresh tracking cycle
+        echo_debug "power-saver" "Energy: Battery recharged (current=$current_charge_mah mAh, old_snapshot used to be lower) - restarting from new charge"
+        return 0
+    fi
+    
+    if [ "$current_charge_mah" -gt 0 ] && [ "$current_charge_mah" -lt "$last_snapshot_charge_mah" ]; then
+        # Battery charge has decreased (valid discharge)
+        local charge_diff_mah
+        charge_diff_mah=$((last_snapshot_charge_mah - current_charge_mah))
+        
+        # Use lowercase variables if uppercase not set (handles first-run cases)
+        local local_time_sav="${TIME_SECONDS_IN_SAV:-${time_seconds_in_sav:-0}}"
+        local local_time_bal="${TIME_SECONDS_IN_BAL:-${time_seconds_in_bal:-0}}"
+        local local_time_prf="${TIME_SECONDS_IN_PRF:-${time_seconds_in_prf:-0}}"
+        
+        local total_time
+        total_time=$((local_time_sav + local_time_bal + local_time_prf))
+
+        echo_debug "power-saver" "Energy calc: charge_diff=$charge_diff_mah mAh, total_time=$total_time sec, SAV=$local_time_sav BAL=$local_time_bal PRF=$local_time_prf"
+        
+        if [ "$total_time" -gt 0 ]; then
+            # Distribute charge diff proportionally by time spent in each profile
+            # Use bc for precise decimal arithmetic (avoid integer division loss)
+            if [ "$local_time_sav" -gt 0 ]; then
+                local charge_sav
+                charge_sav=$(echo "scale=6; $charge_diff_mah * $local_time_sav / $total_time" | bc -l 2>/dev/null || echo "0.000000")
+                local energy_interval_sav
+                energy_interval_sav=$(calculate_energy_from_charge_diff "$charge_sav" "$last_snapshot_voltage_mv")
+                cumulative_energy_sav_wh=$(echo "scale=6; $cumulative_energy_sav_wh + $energy_interval_sav" | bc -l 2>/dev/null || echo "$cumulative_energy_sav_wh")
+            fi
+            if [ "$local_time_bal" -gt 0 ]; then
+                local charge_bal
+                charge_bal=$(echo "scale=6; $charge_diff_mah * $local_time_bal / $total_time" | bc -l 2>/dev/null || echo "0.000000")
+                local energy_interval_bal
+                energy_interval_bal=$(calculate_energy_from_charge_diff "$charge_bal" "$last_snapshot_voltage_mv")
+                cumulative_energy_bal_wh=$(echo "scale=6; $cumulative_energy_bal_wh + $energy_interval_bal" | bc -l 2>/dev/null || echo "$cumulative_energy_bal_wh")
+            fi
+            if [ "$local_time_prf" -gt 0 ]; then
+                local charge_prf
+                charge_prf=$(echo "scale=6; $charge_diff_mah * $local_time_prf / $total_time" | bc -l 2>/dev/null || echo "0.000000")
+                local energy_interval_prf
+                energy_interval_prf=$(calculate_energy_from_charge_diff "$charge_prf" "$last_snapshot_voltage_mv")
+                cumulative_energy_prf_wh=$(echo "scale=6; $cumulative_energy_prf_wh + $energy_interval_prf" | bc -l 2>/dev/null || echo "$cumulative_energy_prf_wh")
+            fi
+            
+            echo_debug "power-saver" "Energy updated: SAV=${cumulative_energy_sav_wh} BAL=${cumulative_energy_bal_wh} PRF=${cumulative_energy_prf_wh}"
+            
+            # Update snapshot charge for next calculation (but NOT timestamp - that stays constant!)
+            last_snapshot_charge_mah=$current_charge_mah
+        fi
+    fi
+}
+
+start_scx_p2dq() {
+    # Start scx_p2dq scheduler with appropriate flags
+    # Returns 0 on success, 1 if startup failed
+    
+    # Flag generation for scx_p2dq:
+    local p2dq_flags="-a -r 5 -y -f -k --single-llc-fast-path --enable-pelt true --min-nr-queued-pick2 4 --keep-running --cpu-priority true --latency-priority --dhq-enabled true"
+    
+    # Check whether this is an AMD CPU
+    if [ -f /proc/cpuinfo ] && grep -qi "AuthenticAMD" /proc/cpuinfo; then
+        # AMD EAS (Energy Aware Scheduling), significantly more efficient than CFS
+        p2dq_flags="$p2dq_flags --enable-eas true"
+    fi
+
+    # Kernel-Feature Check: Check for sched_ext support (Kernel 6.11+)
+    # Checking for the directory existence in sysfs
+    if [ ! -d "/sys/kernel/sched_ext" ]; then
+        echo_debug "power-saver" "INFO: sched_ext not supported by kernel, falling back to default scheduler."
+        return 1
+    fi
+
+    # Start scheduler with the appropriate flags
+    # shellcheck disable=SC2086
+    if /bin/bash -c 'exec scx_p2dq $p2dq_flags ' 2>/dev/null &
+    then
+        echo "$!" > "$RUNDIR/scx_p2dq.pid" 2>/dev/null || true
+        return 0
+    else
+        return 1
+    fi
+}
+
+stop_scx_p2dq() {
+    # Stop scx_p2dq gracefully, or fall back to default kernel scheduler
+    local scx_pidfile="$RUNDIR/scx_p2dq.pid"
+    
+    # Try to stop via PID file first
+    if [ -f "$scx_pidfile" ]; then
+        local scx_pid
+        scx_pid=$(cat "$scx_pidfile" 2>/dev/null)
+        if [ -n "$scx_pid" ]; then
+            # Try SIGTERM for graceful shutdown
+            kill -TERM "$scx_pid" 2>/dev/null
+            # Wait briefly for graceful shutdown
+            sleep 0.5
+            # Force kill if still running
+            kill -9 "$scx_pid" 2>/dev/null || true
+        fi
+        rm -f "$scx_pidfile" 2>/dev/null || true
+    else
+        # Fallback: kill by process name
+        pkill -TERM -f scx_p2dq 2>/dev/null || true
+        sleep 0.5
+        pkill -9 -f scx_p2dq 2>/dev/null || true
+    fi
+    
+    echo_debug "power-saver" "scx_p2dq stopped"
+}
+
+check_scx_p2dq_health() {
+    # Verify scx_p2dq is still running by checking PID file and process existence
+    local scx_pidfile="$RUNDIR/scx_p2dq.pid"
+    
+    if [ ! -f "$scx_pidfile" ]; then
+        return 1
+    fi
+    
+    local scx_pid
+    scx_pid=$(cat "$scx_pidfile" 2>/dev/null)
+    
+    if [ -n "$scx_pid" ] && kill -0 "$scx_pid" 2>/dev/null; then
+        return 0
+    else
+        rm -f "$scx_pidfile" 2>/dev/null || true
+        return 1
+    fi
 }
 
 set_pm_qos_constraints() {
@@ -246,7 +646,6 @@ set_pm_qos_constraints() {
     if [ "$cpu_count" -gt 0 ]; then
         if [ "$failed" -eq 0 ]; then
             [ "$constraint" = "no_constraint" ] && constraint="-1"
-            echo_debug "power-saver" "PM QoS constraints: set $constraint µs on $success/$cpu_count CPUs"
         else
             echo_debug "power-saver" "PM QoS constraints: partial failure ($success/$cpu_count CPUs updated, $failed failed)"
         fi
@@ -255,8 +654,372 @@ set_pm_qos_constraints() {
     fi
 }
 
+set_idle_governor() {
+    # Set CPU idle governor with fallback strategy
+    # Prefers TEO (Tickless EQuilibrium, available since Linux 5.7) for better power efficiency
+    # Falls back to MENU governor if TEO not available
+    # Keeps current governor if neither TEO nor MENU can be set
+
+    local cpuidle_dir="/sys/devices/system/cpu/cpuidle"
+    local current_governor="" new_governor=""
+
+    # Check if cpuidle sysfs interface exists
+    if [ ! -d "$cpuidle_dir" ]; then
+        echo_debug "power-saver" "Idle governor: cpuidle sysfs not available"
+        #return 0
+    fi
+
+    # Read current governor
+    if [ -f "$cpuidle_dir/current_governor" ]; then
+        current_governor=$(cat "$cpuidle_dir/current_governor" 2>/dev/null)
+    fi
+
+    # Determine which governor to set
+    new_governor=""
+
+    # Try TEO first (preferred for modern systems, Linux 5.7+)
+    if [ -f "$cpuidle_dir/current_governor" ]; then
+        if grep -q "teo" "$cpuidle_dir/available_governors" 2>/dev/null; then
+            new_governor="teo"
+        elif grep -q "menu" "$cpuidle_dir/available_governors" 2>/dev/null; then
+            # Fallback to MENU if TEO not available
+            new_governor="menu"
+        fi
+    fi
+
+    # If no governor could be selected, keep current
+    if [ -z "$new_governor" ]; then
+        echo_debug "power-saver" "Idle governor: neither teo nor menu available, keeping $current_governor"
+        return 0
+    fi
+
+    # Skip if already using the desired governor
+    if [ "$current_governor" = "$new_governor" ]; then
+        return 0
+    fi
+
+    # Try to set the new governor
+    if echo "$new_governor" > "$cpuidle_dir/current_governor" 2>/dev/null; then
+        return 0
+    else
+        echo_debug "power-saver" "Idle governor: failed to switch to $new_governor (need root?)"
+    fi
+}
+
+optimize_vm_parameters() {
+    # Apply VM/Memory kernel parameters for power efficiency
+    # These are best-practice defaults that reduce CPU wakeups and I/O overhead
+    # Applied once at daemon startup, not per profile change
+    
+    local param value sysctl_file current_value
+    local success=0 failed=0
+    
+    # Best practice defaults for power efficiency:
+    # - page-cluster=0: Minimal swap clustering, reduces I/O thrashing
+    # - stat_interval=60: Extended stats update interval, fewer CPU wakeups
+    # - watermark_boost_factor=0: Disable aggressive memory reclaim, less CPU overhead
+    
+    vm_params="page-cluster:0 stat_interval:60 watermark_boost_factor:0"
+    
+    for param_pair in $vm_params; do
+        param="${param_pair%:*}"
+        value="${param_pair#*:}"
+        sysctl_file="/proc/sys/vm/$param"
+        
+        # Check if parameter exists and is writable
+        if [ ! -f "$sysctl_file" ]; then
+            echo_debug "power-saver" "VM optimization: $param not available"
+            continue
+        fi
+        
+        if [ ! -w "$sysctl_file" ]; then
+            echo_debug "power-saver" "VM optimization: $param not writable"
+            failed=$((failed + 1))
+            continue
+        fi
+        
+        # Read current value to avoid redundant writes
+        current_value=$(cat "$sysctl_file" 2>/dev/null)
+        
+        if [ "$current_value" = "$value" ]; then
+            success=$((success + 1))
+            continue
+        fi
+        
+        # Try to set the parameter
+        if echo "$value" > "$sysctl_file" 2>/dev/null; then
+            success=$((success + 1))
+        else
+            echo_debug "power-saver" "VM optimization: failed to set $param=$value"
+            failed=$((failed + 1))
+        fi
+    done
+    
+    if [ "$failed" -gt 0 ]; then
+        echo_debug "power-saver" "VM optimization: $success/$((success + failed)) parameters applied"
+    fi
+}
+
+enable_favordynmods() {
+    # Enable favordynmods for faster cgroup modifications (cpuset.cpus updates)
+    # Trade-off: slightly slower fork/exit, but faster task migration and controller changes
+    # Beneficial for workload-dependent CPU scaling where cpuset.cpus changes frequently      
+    mount -o remount,defaults,favordynmods /sys/fs/cgroup
+}
+
+disable_favordynmods() {
+    # Restore default cgroup behavior
+    mount -o remount,defaults /sys/fs/cgroup
+}
+
+enable_cpuset_controller() {
+    # Enable cpuset controller in cgroup hierarchy
+    # In Cgroups v2, controllers must be explicitly enabled in subtree_control
+    # This allows cpuset.cpus and other cpuset files to become available
+    
+    local cgroup_path
+    local cgroup_dir
+    
+    # Try to enable in root cgroup first
+    if [ -w "/sys/fs/cgroup/cgroup.subtree_control" ]; then
+        echo "+cpuset" > "/sys/fs/cgroup/cgroup.subtree_control" 2>/dev/null
+    fi
+    
+    # Then enable in process-specific cgroup
+    cgroup_path=$(sed -e 's/^[0-9]*:[^:]*://' /proc/self/cgroup 2>/dev/null)
+    if [ -n "$cgroup_path" ] && [ "$cgroup_path" != "/" ]; then
+        cgroup_dir="/sys/fs/cgroup${cgroup_path}"
+        if [ -w "${cgroup_dir}/cgroup.subtree_control" ]; then
+            echo "+cpuset" > "${cgroup_dir}/cgroup.subtree_control" 2>/dev/null
+        fi
+    fi
+}
+
+write_cpuset_mask() {
+    # Write CPU mask to cpuset.cpus with proper error handling
+    # Writes to both system.slice AND user.slice for consistent constraints
+    # Returns 0 if at least one succeeds, 1 if all fail
+    local cpu_mask="$1"
+    local success=0
+    
+    # system.slice (where systemd services run)
+    # Enable controller immediately before write to avoid race conditions
+    enable_cpuset_controller
+    if [ -f "/sys/fs/cgroup/system.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/system.slice/cpuset.cpus" ]; then
+        if echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null; then
+            success=1
+        fi
+    fi
+    
+    # user.slice (where user processes run)
+    # Write independently of system.slice result to ensure both are constrained
+    enable_cpuset_controller
+    if [ -f "/sys/fs/cgroup/user.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/user.slice/cpuset.cpus" ]; then
+        if echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null; then
+            success=1
+        fi
+    fi
+
+    [ "$success" -eq 1 ] && return 0 || return 1
+}
+
+scale_cpu_cores_sav() {
+    # SAV-only progressive core scaling based on workload with SMT-aware topology
+    local workload="${1:-0}"
+    local cpu_online_dir="/sys/devices/system/cpu"    
+    local total_cores=0
+    local active_cores=0    
+    local primary_threads=""
+    local secondary_threads=""
+    local seen_cores=""
+    
+    # Build SMT-aware thread lists by analyzing thread_siblings_list
+    # Primary threads = first thread of each physical core
+    # Secondary threads = HT siblings (added only when needed)
+    for cpu_dir in "$cpu_online_dir"/cpu[0-9]*; do
+        [ ! -d "$cpu_dir" ] && continue
+        
+        local cpu_num="${cpu_dir##*cpu}"
+        local siblings_file="$cpu_dir/topology/thread_siblings_list"
+        
+        # Skip if topology info not available
+        [ ! -f "$siblings_file" ] && continue
+        
+        # Count total and active cores
+        if [ -f "$cpu_dir/online" ]; then
+            total_cores=$((total_cores + 1))
+            if [ "$(cat "$cpu_dir/online" 2>/dev/null)" = "1" ]; then
+                active_cores=$((active_cores + 1))
+            fi
+        elif [ "$cpu_num" = "0" ]; then
+            # CPU0 has no online file (always online)
+            total_cores=$((total_cores + 1))
+            active_cores=$((active_cores + 1))
+        fi
+        
+        # Read siblings list to identify primary vs secondary threads
+        local siblings
+        siblings=$(cat "$siblings_file" 2>/dev/null | tr ',-' ' ')
+        
+        # Extract first sibling (primary thread of this core)
+        local first_sibling=""
+        for sib in $siblings; do
+            first_sibling="$sib"
+            break
+        done
+        
+        # Skip if we already processed this physical core
+        echo "$seen_cores" | grep -q " $first_sibling " && continue
+        seen_cores="$seen_cores $first_sibling "
+        
+        # Classify: if current CPU is the first sibling, it's primary; otherwise secondary
+        if [ "$cpu_num" = "$first_sibling" ]; then
+            primary_threads="$primary_threads $cpu_num"
+        else
+            secondary_threads="$secondary_threads $cpu_num"
+        fi
+    done
+    
+    if [ "$total_cores" -lt 2 ]; then
+        return 0
+    fi
+    
+    # Calculate target based on workload
+    local target_cores
+    if [ "$workload" -lt 5 ]; then
+        target_cores=$((total_cores / 4))  # 25%
+    elif [ "$workload" -lt 10 ]; then
+        target_cores=$((total_cores / 2))  # 50%
+    elif [ "$workload" -lt 15 ]; then
+        target_cores=$((total_cores * 3 / 4))  # 75%
+    else
+        target_cores=$total_cores  # 100%
+    fi
+    
+    [ "$target_cores" -lt 1 ] && target_cores=1
+    [ "$target_cores" -gt "$total_cores" ] && target_cores=$total_cores
+    
+    if [ "$active_cores" -eq "$target_cores" ]; then
+        return 0  # Already at target
+    fi
+
+    # Build CPU mask: primary threads first (different physical cores)
+    # then secondary threads (HT siblings) only when workload increases
+    # This maximizes cache efficiency and minimizes power at low loads
+    local cpu_mask=""
+    local count=0
+    
+    # Add primary threads first (one thread per physical core)
+    for cpu in $primary_threads; do
+        if [ "$count" -lt "$target_cores" ]; then
+            if [ -z "$cpu_mask" ]; then
+                cpu_mask="$cpu"
+            else
+                cpu_mask="$cpu_mask,$cpu"
+            fi
+            count=$((count + 1))
+        fi
+    done
+    
+    # Add secondary threads (HT siblings) if needed for higher workloads
+    if [ "$count" -lt "$target_cores" ]; then
+        for cpu in $secondary_threads; do
+            if [ "$count" -lt "$target_cores" ]; then
+                cpu_mask="$cpu_mask,$cpu"
+                count=$((count + 1))
+            fi
+        done
+    fi
+
+    # Apply via Cgroups cpuset.cpus
+    write_cpuset_mask "$cpu_mask"
+}
+
+scale_cpu_cores() {
+    # Dispatch to appropriate function based on profile
+    # All profiles now use Cgroups for consistent core management with scx_p2dq
+    local workload="${1:-0}"
+    local profile="${2:-SAV}"
+    local cpu_online_dir="/sys/devices/system/cpu"
+    local total_cores=0
+    
+    # Count total cores
+    for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
+        if [ -f "$cpu_online" ]; then
+            total_cores=$((total_cores + 1))
+        fi
+    done
+    
+    if [ "$total_cores" -lt 1 ]; then
+        return 0
+    fi
+    
+    if [ "$profile" = "BAL" ] || [ "$profile" = "PRF" ]; then
+        # Activate all cores via Cgroups (consistent with SAV)
+        local cpu_mask="0-$total_cores"
+        write_cpuset_mask "$cpu_mask"
+        disable_favordynmods  # Disable after write to avoid fork/exit overhead
+    else
+        # SAV: progressive core scaling via Cgroups
+        enable_favordynmods
+        scale_cpu_cores_sav "$workload"
+    fi
+}
+
+get_ac_power() {
+    # Determine if running on AC power (1=on AC, 0=on battery)
+    # Optimized: check first battery only (most systems have just one)    
+    local bat_dir
+    for d in /sys/class/power_supply/BAT*; do
+        if [ -d "$d" ]; then
+            bat_dir="$d"
+            break
+        fi
+    done
+
+    if [ -n "$bat_dir" ] && [ -f "$bat_dir/status" ]; then
+        local status
+        status=$(cat "$bat_dir/status" 2>/dev/null)
+        case "$status" in
+            Discharging) echo 0; return 0 ;;
+            *) echo 1; return 0 ;;
+        esac
+    fi
+    
+    # Fallback: check AC adapter directly
+    if [ -f /sys/class/power_supply/AC/online ]; then
+        cat /sys/class/power_supply/AC/online 2>/dev/null || echo 1
+        return 0
+    fi
+    
+    # Fallback: assume AC power if we can't determine
+    echo 1
+}
+
 apply_profile() {
     local profile="$1"
+    local workload="${2:-0}"
+    local switch_type="${3:-THRESHOLD}"  # PROACTIVE or THRESHOLD
+    
+    # Accumulate time for the old profile BEFORE switching
+    # This ensures no time is lost if the profile changes too quickly for save_psd_state() to capture
+    if [ -n "$profile_start_time" ] && [ "$profile_start_time" -gt 0 ] && [ -n "$last_state" ]; then
+        local time_in_profile=$(($(date +%s) - profile_start_time))
+        case "$last_state" in
+            SAV) time_seconds_in_sav=$((${time_seconds_in_sav:-0} + time_in_profile)) ;;
+            BAL) time_seconds_in_bal=$((${time_seconds_in_bal:-0} + time_in_profile)) ;;
+            PRF) time_seconds_in_prf=$((${time_seconds_in_prf:-0} + time_in_profile)) ;;
+        esac
+        # Update uppercase variables for energy calculations (handles first-run cases where uppercase may not be set yet)
+        TIME_SECONDS_IN_SAV=${time_seconds_in_sav:-0}
+        TIME_SECONDS_IN_BAL=${time_seconds_in_bal:-0}
+        TIME_SECONDS_IN_PRF=${time_seconds_in_prf:-0}
+        echo_debug "power-saver" "Time accumulated (profile switch): SAV=$time_seconds_in_sav BAL=$time_seconds_in_bal PRF=$time_seconds_in_prf"
+    fi
+    
+    # Reset profile timer for new profile
+    profile_start_time=$(date +%s)
+    
     # Map SAV, BAL, PRF internal names to tlp command names
     # Also set corresponding PM QoS constraints
     case "$profile" in
@@ -270,23 +1033,1143 @@ apply_profile() {
             ;;
         PRF)
             tlp_profile="performance"
-            pm_qos_constraint=100     # 100µs: strict latency, no deep idle
+            pm_qos_constraint=100     # 100µs: strict latency, no deep idle   
             ;;
         *)
             tlp_profile="$profile"
             pm_qos_constraint=""
             ;;
     esac
-    
-    echo_debug "power-saver" "Applying profile: $tlp_profile"
-    
-    # Apply TLP profile via tlp command
-    @TLP_SBIN@/tlp "$tlp_profile" >/dev/null 2>&1 || true
-    
+
+    # Scale CPU cores FIRST (activate all for BAL/PRF) before applying profile
+    # This ensures the tlp command sees all available cores and applies the profile correctly
+    scale_cpu_cores "$workload" "$profile"
+  
+    # Apply TLP profile via tlp command (with all cores now available)
+    /usr/sbin/tlp "$tlp_profile" >/dev/null 2>&1 || true
+
+    echo_debug "power-saver" "[$switch_type] switched from $last_state to $profile at (avg=$workload)"
+ 
     # Set PM QoS constraints if available
     if [ -n "$pm_qos_constraint" ]; then
         set_pm_qos_constraints "$pm_qos_constraint"
     fi
+    
+    # Update current state
+    last_state="$profile"
+}
+
+display_status() {
+    # Display daemon intelligence and learning statistics (uses IN-MEMORY CACHE)
+    # Readable by non-root users    
+    local now
+    now=$(date +%s)  # Current time for energy tracking calculations
+    
+    # Ensure cache is loaded
+    load_psd_state
+    
+    if [ -z "$psd_state_cache" ]; then
+        echo_debug "Error: Power Saver Daemon state file not found"
+        return 1
+    fi
+    
+    # Read from cache instead of disk
+    # Secure, and highly performant POSIX code (zero-fork)
+    while IFS='=' read -r key value; do
+        # Ignore empty lines, comments, and the complex pattern data lines
+        # BUT allow HIT_PATTERN_COUNT to be loaded normally
+        case "$key" in
+            '' | \#* | HIT_PATTERN_[0-9]*) continue ;;
+        esac
+
+        # Strict whitelisting for the key (alphanumeric and underscores only)
+        case "$key" in
+            *[!a-zA-Z0-9_]*) continue ;;
+        esac
+
+        # Strict whitelisting for the value (alphanumeric, minus, dot, comma)
+        case "$value" in
+            *[!a-zA-Z0-9_.,-]*) continue ;;
+        esac
+
+        # Safe assignment
+        eval "$key='$value'"
+        
+    done <<EOF
+$psd_state_cache
+EOF
+
+    # Use saved evaluation stage from cache (or default to "early" if not set)
+    local STAGE="${EVALUATION_STAGE:-early}"
+
+    # Count patterns by profile type from cache
+    pattern_sav=0
+    pattern_bal=0
+    pattern_prf=0
+    pattern_total=${HIT_PATTERN_COUNT:-0}
+    
+    # Read patterns from cache to count by profile
+    while IFS= read -r line; do
+        case "$line" in
+            *TARGET_PROFILE=*)
+                profile="${line#*TARGET_PROFILE=\'}"
+                profile="${profile%\'*}"                
+                case "$profile" in
+                    SAV) pattern_sav=$((pattern_sav + 1)) ;;
+                    BAL) pattern_bal=$((pattern_bal + 1)) ;;
+                    PRF) pattern_prf=$((pattern_prf + 1)) ;;
+                esac
+                ;;
+        esac
+    done <<EOF
+$psd_state_cache
+EOF
+
+    # Calculate prediction accuracy percentage
+    prediction_pct=0
+    if [ "$PREDICTION_TOTAL" -gt 0 ]; then
+        prediction_pct=$((PREDICTION_HITS * 100 / PREDICTION_TOTAL))
+    fi
+    
+    # Calculate profile distribution percentages
+    total_samples=${HISTORY_COUNT:-0}
+    bucket_total=$((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0} + ${CUMULATIVE_BUCKET_20plus:-0}))
+    
+    sav_pct=0
+    bal_pct=0
+    prf_pct=0
+    
+    if [ "$bucket_total" -gt 0 ]; then
+        # Low lag (0-10) = SAV
+        sav_pct=$((((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0}) * 100) / bucket_total))
+        # Medium lag (10-20) = BAL
+        bal_pct=$((((${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0}) * 100) / bucket_total))
+        # High lag (20+) = PRF (gets remainder to ensure 100% total)
+        prf_pct=$((100 - sav_pct - bal_pct))
+    fi
+    
+    # Convert learning interval from seconds to minutes
+    learning_minutes=$((optimal_update_interval / 60))
+ 
+    # Calculate cumulative energy consumption since daemon startup
+    # Load with full 6-decimal precision internally, round to 2 decimals for display
+    local energy_used_wh_sav="${CUMULATIVE_ENERGY_SAV_WH:-0.000000}"
+    local energy_used_wh_bal="${CUMULATIVE_ENERGY_BAL_WH:-0.000000}"
+    local energy_used_wh_prf="${CUMULATIVE_ENERGY_PRF_WH:-0.000000}"
+    local total_energy_used_wh="0.00 Wh"
+    local energy_interval_info=""
+    
+    if [ -n "$LAST_SNAPSHOT_TIMESTAMP" ] && [ "$LAST_SNAPSHOT_TIMESTAMP" -gt 0 ]; then
+        # Calculate total cumulative energy (sum of all profiles) with scale=6 precision
+        local total_sum
+        total_sum=$(echo "scale=6; $energy_used_wh_sav + $energy_used_wh_bal + $energy_used_wh_prf" | bc -l 2>/dev/null || echo "0.000000")
+        total_energy_used_wh=$(format_energy_value "$total_sum")
+        
+        # Format individual values with appropriate units (Wh or mWh)
+        energy_used_wh_sav=$(format_energy_value "$energy_used_wh_sav")
+        energy_used_wh_bal=$(format_energy_value "$energy_used_wh_bal")
+        energy_used_wh_prf=$(format_energy_value "$energy_used_wh_prf")
+        
+        local now
+        now=$(date +%s)
+        local snapshot_minutes
+        snapshot_minutes=$(((now - LAST_SNAPSHOT_TIMESTAMP) / 60))
+        energy_interval_info="(cumulative since ${snapshot_minutes}min ago)"
+    else
+        # No energy data yet, show as 0.00 Wh
+        energy_used_wh_sav=$(format_energy_value "$energy_used_wh_sav")
+        energy_used_wh_bal=$(format_energy_value "$energy_used_wh_bal")
+        energy_used_wh_prf=$(format_energy_value "$energy_used_wh_prf")
+    fi
+
+    # Calculate total daemon running time
+    local time_sav_sec="${TIME_SECONDS_IN_SAV:-0}"
+    local time_bal_sec="${TIME_SECONDS_IN_BAL:-0}"
+    local time_prf_sec="${TIME_SECONDS_IN_PRF:-0}"
+    local total_runtime_sec
+    total_runtime_sec=$((time_sav_sec + time_bal_sec + time_prf_sec))
+    local formatted_runtime
+    formatted_runtime=$(format_duration "$total_runtime_sec")
+
+    # Calculate average energy consumption per hour (Wh/h) with scale=6 precision, handle zero runtime 
+    local energy_per_hour_raw
+    energy_per_hour_raw=$(echo "scale=6; if ($total_runtime_sec > 0) $total_sum / ($total_runtime_sec / 3600) else 0" | bc -l 2>/dev/null || echo "0.000000")
+    local energy_per_hour
+    energy_per_hour="$(format_energy_value "$energy_per_hour_raw")/h"
+
+    # Calculate estimated battery runtime at current consumption rate
+    local formatted_battery_time=""
+    if [ -n "$energy_per_hour_raw" ] && [ "$(echo "$energy_per_hour_raw > 0" | bc -l 2>/dev/null)" = "1" ]; then
+        local charge_full_mah voltage_mv
+        charge_full_mah=$(get_battery_charge_full_mah)
+        voltage_mv=$(get_battery_voltage_mv)
+        
+        if [ "$charge_full_mah" -gt 0 ] && [ "$voltage_mv" -gt 0 ]; then
+            # Convert mAh to Wh: (mAh * mV) / 1000000
+            # Then calculate hours: capacity_Wh / consumption_Wh_per_hour
+            local battery_runtime_hours
+            battery_runtime_hours=$(echo "scale=2; ($charge_full_mah * $voltage_mv / 1000000.0) / $energy_per_hour_raw" | bc -l 2>/dev/null || echo "0")
+            local battery_runtime_sec
+            battery_runtime_sec=$(echo "scale=0; $battery_runtime_hours * 3600 / 1" | bc -l 2>/dev/null || echo "0")
+            formatted_battery_time=$(format_duration "$battery_runtime_sec")
+        fi
+    fi
+    
+    printf "\n"
+    printf "=== TLP Power Saver Daemon Status ===\n"
+    printf "\nDaemon Runtime:\n"
+    printf "  %s\n" "$formatted_runtime"
+    printf "\nEstimated fullcharge Battery Life:\n"
+    printf "  %s\n" "${formatted_battery_time:-N/A}"
+    printf "\nIntelligence:\n"
+    printf "  Confidence Level: %d/100 (%d min learning cycle)\n" "$trend_confidence" "$learning_minutes"
+    printf "\nPredictions:\n"
+    printf "  Accuracy: %d/%d (%d%%)\n" "$PREDICTION_HITS" "$PREDICTION_TOTAL" "$prediction_pct"
+    printf "\nLearned Patterns:\n"
+    printf "  Total: %d (SAV: %d, BAL: %d, PRF: %d)\n" "$pattern_total" "$pattern_sav" "$pattern_bal" "$pattern_prf"
+    printf "\nProactive Switches:\n"
+    printf "  Executed: %d\n" "$PROACTIVE_SWITCHES"
+    printf "\nProfile Distribution:\n"
+    printf "  SAV: %d%% | BAL: %d%% | PRF: %d%%\n" "$sav_pct" "$bal_pct" "$prf_pct"
+    printf "\nEnergy Consumption:\n"
+    printf "  SAV: %s | BAL: %s | PRF: %s | Total: %s | Average: %s\n" "$energy_used_wh_sav" "$energy_used_wh_bal" "$energy_used_wh_prf" "$total_energy_used_wh" "$energy_per_hour"
+    printf "\nCurrent Profile:\n"
+    printf "  %s\n" "$LAST_STATE"
+    printf "\n"
+}
+
+save_psd_state() {
+    # Save current daemon state to persist across restarts (with IN-MEMORY CACHING)
+    # Stores: longterm_avg, adaptive thresholds, history buckets for optimization
+    local state_dir="/var/lib/tlp"
+    local state_file="$state_dir/psd-state.conf"
+    local temp_file="${state_file}.tmp$$"
+    
+    # Create directory if missing (should exist from Makefile install)
+    mkdir -p "$state_dir" 2>/dev/null || {
+        echo_debug "power-saver" "ERROR: Cannot write to $state_dir (permission denied?)"
+        return 1
+    }
+    
+    # Energy tracking: accumulate time in current profile FIRST (before energy calculation)
+    # This ensures TIME_SECONDS_IN_* variables are up-to-date for cumulative energy calculation
+    if [ -n "$profile_start_time" ] && [ "$profile_start_time" -gt 0 ]; then
+        local time_in_profile=$(($(date +%s) - profile_start_time))
+        case "$last_state" in
+            SAV) time_seconds_in_sav=$((${time_seconds_in_sav:-0} + time_in_profile)) ;;
+            BAL) time_seconds_in_bal=$((${time_seconds_in_bal:-0} + time_in_profile)) ;;
+            PRF) time_seconds_in_prf=$((${time_seconds_in_prf:-0} + time_in_profile)) ;;
+        esac
+        profile_start_time=$(date +%s)  # Reset timer for next interval
+    fi
+    
+    # Update uppercase variables so update_cumulative_energy() reads current values
+    TIME_SECONDS_IN_SAV=${time_seconds_in_sav:-0}
+    TIME_SECONDS_IN_BAL=${time_seconds_in_bal:-0}
+    TIME_SECONDS_IN_PRF=${time_seconds_in_prf:-0}
+    
+    # Update cumulative energy values AFTER time accumulation
+    update_cumulative_energy
+    
+    # Build history scores string
+    local history_scores=""
+    for entry in $longterm_buf; do
+        local score="${entry#*:}"
+        if [ -z "$history_scores" ]; then
+            history_scores="$score"
+        else
+            history_scores="${history_scores},${score}"
+        fi
+    done
+
+    # Use already-accumulated bucket counters from run_loop()
+    local bucket_0_5="${CUMULATIVE_BUCKET_0_5:-0}"
+    local bucket_5_10="${CUMULATIVE_BUCKET_5_10:-0}"
+    local bucket_10_15="${CUMULATIVE_BUCKET_10_15:-0}"
+    local bucket_15_20="${CUMULATIVE_BUCKET_15_20:-0}"
+    local bucket_20plus="${CUMULATIVE_BUCKET_20plus:-0}"
+    
+    # Capture current variable values JUST BEFORE writing to file
+    local saved_trend_confidence="$trend_confidence"
+    local saved_prediction_hits="$prediction_hits"
+    local saved_prediction_total="$prediction_total"
+    local saved_proactive_switch_count="$proactive_switch_count"
+    local saved_optimal_update_interval="$optimal_update_interval"
+   
+    # Write to temp file first (atomic write)
+    cat > "$temp_file" <<EOF
+# TLP Power Saver Daemon Permanent Patterns
+# Generated: $(date)
+LONGTERM_AVG=$longterm_avg
+ADAPT_THR_LOW=${adapt_thr_low:-0}
+ADAPT_THR_HIGH=${adapt_thr_high:-0}
+OPTIMAL_LOW=$optimal_low
+OPTIMAL_OFFSET=${optimal_offset:-$SAV_DYNAMIC_THRESHOLD_OFFSET}
+LAST_STATE=$last_state
+LAST_PROFILE_SCORE=$last_profile_score
+HISTORY_COUNT=$(echo "$longterm_buf" | wc -w)
+PREDICTION_TIME=${prediction_time:-0}
+PREDICTION_OFFSET=${prediction_offset:-0}
+PREDICTION_AVG=${prediction_avg:-0}
+PREDICTION_HITS=${saved_prediction_hits:-0}
+PREDICTION_TOTAL=${saved_prediction_total:-0}
+TREND_CONFIDENCE=$saved_trend_confidence
+LEARNING_INTERVAL=$saved_optimal_update_interval
+EVALUATION_STAGE=${STAGE:-early}
+PROACTIVE_SWITCHES=$saved_proactive_switch_count
+CUMULATIVE_BUCKET_0_5=$bucket_0_5
+CUMULATIVE_BUCKET_5_10=$bucket_5_10
+CUMULATIVE_BUCKET_10_15=$bucket_10_15
+CUMULATIVE_BUCKET_15_20=$bucket_15_20
+CUMULATIVE_BUCKET_20plus=$bucket_20plus
+LAST_SNAPSHOT_TIMESTAMP=${last_snapshot_timestamp:-0}
+LAST_SNAPSHOT_CHARGE_MAH=${last_snapshot_charge_mah:-0}
+LAST_SNAPSHOT_VOLTAGE_MV=${last_snapshot_voltage_mv:-0}
+CUMULATIVE_ENERGY_SAV_WH=${cumulative_energy_sav_wh:-0.000000}
+CUMULATIVE_ENERGY_BAL_WH=${cumulative_energy_bal_wh:-0.000000}
+CUMULATIVE_ENERGY_PRF_WH=${cumulative_energy_prf_wh:-0.000000}
+TIME_SECONDS_IN_SAV=${time_seconds_in_sav:-0}
+TIME_SECONDS_IN_BAL=${time_seconds_in_bal:-0}
+TIME_SECONDS_IN_PRF=${time_seconds_in_prf:-0}
+HIT_PATTERN_COUNT=$permanent_pattern_count
+EOF
+    
+    # Write all permanent patterns with UPDATED HITS values from bash variables
+    for i in $(seq 1 "$permanent_pattern_count"); do
+        eval "scores=\$hit_pattern_${i}_scores"
+        eval "hits=\$hit_pattern_${i}_hits"
+        eval "profile=\$hit_pattern_${i}_target_profile"
+        [ -n "$scores" ] && echo "HIT_PATTERN_${i}_SCORES='$scores' HITS=$hits TARGET_PROFILE='$profile'" >> "$temp_file"
+    done
+    
+    # UPDATE CACHE WITH NEW CONTENT
+    psd_state_cache=$(cat "$temp_file" 2>/dev/null)
+    
+    # Atomically replace old file (mv is atomic on same filesystem)
+    if [ -f "$temp_file" ]; then
+        mv -f "$temp_file" "$state_file" 2>/dev/null || rm -f "$temp_file" 2>/dev/null
+    fi
+    
+    # Make state file readable by non-root users
+    chmod 0644 "$state_file" 2>/dev/null || true
+}
+
+load_psd_state() {
+    # Load previously saved daemon state from persistent storage (with IN-MEMORY CACHING)
+    # Location: /var/lib/tlp (created during Makefile installation)
+    local state_file="/var/lib/tlp/psd-state.conf"
+    
+    # Only load from disk if not already cached
+    if [ "$psd_state_loaded" -eq 1 ]; then
+        return 0
+    fi
+    
+    if [ ! -f "$state_file" ]; then
+        psd_state_loaded=1
+        return 0
+    fi
+    
+    # READ ENTIRE FILE INTO CACHE (once, on first load)
+    psd_state_cache=$(cat "$state_file" 2>/dev/null)
+    psd_state_loaded=1
+    
+    # Parse cache: Extract standard variables (non-HIT_PATTERN lines)
+    # Secure, and highly performant POSIX code (zero-fork)
+    while IFS='=' read -r key value; do
+        # Ignore empty lines, comments, and complex pattern data lines
+        # BUT allow HIT_PATTERN_COUNT to be loaded normally
+        case "$key" in
+            '' | \#* | HIT_PATTERN_[0-9]*) continue ;;
+        esac
+
+        # Strict whitelisting for the key (alphanumeric and underscores only)
+        case "$key" in
+            *[!a-zA-Z0-9_]*) continue ;;
+        esac
+
+        # Strict whitelisting for the value (alphanumeric, minus, dot, comma)
+        case "$value" in
+            *[!a-zA-Z0-9_.,-]*) continue ;;
+        esac
+
+        # Safe assignment
+        eval "$key='$value'"
+        
+    done <<EOF
+$psd_state_cache
+EOF
+    
+    # Always restore learned system parameters
+    longterm_avg=$LONGTERM_AVG
+    adapt_thr_low=$ADAPT_THR_LOW
+    adapt_thr_high=$ADAPT_THR_HIGH
+    optimal_low=$OPTIMAL_LOW
+    optimal_offset=${OPTIMAL_OFFSET:-$SAV_DYNAMIC_THRESHOLD_OFFSET}
+    last_profile_score=$LAST_PROFILE_SCORE
+    
+    # Restore cumulative profile distribution buckets (persistent across restarts)
+    CUMULATIVE_BUCKET_0_5=${CUMULATIVE_BUCKET_0_5:-0}
+    CUMULATIVE_BUCKET_5_10=${CUMULATIVE_BUCKET_5_10:-0}
+    CUMULATIVE_BUCKET_10_15=${CUMULATIVE_BUCKET_10_15:-0}
+    CUMULATIVE_BUCKET_15_20=${CUMULATIVE_BUCKET_15_20:-0}
+    CUMULATIVE_BUCKET_20plus=${CUMULATIVE_BUCKET_20plus:-0}
+    
+    export CUMULATIVE_BUCKET_0_5 CUMULATIVE_BUCKET_5_10 CUMULATIVE_BUCKET_10_15 
+    export CUMULATIVE_BUCKET_15_20 CUMULATIVE_BUCKET_20plus
+    
+    # Restore energy consumption tracking (cumulative, 6-decimal precision)
+    last_snapshot_timestamp=${LAST_SNAPSHOT_TIMESTAMP:-0}
+    last_snapshot_charge_mah=${LAST_SNAPSHOT_CHARGE_MAH:-0}
+    last_snapshot_voltage_mv=${LAST_SNAPSHOT_VOLTAGE_MV:-0}
+    cumulative_energy_sav_wh=${CUMULATIVE_ENERGY_SAV_WH:-0.000000}
+    cumulative_energy_bal_wh=${CUMULATIVE_ENERGY_BAL_WH:-0.000000}
+    cumulative_energy_prf_wh=${CUMULATIVE_ENERGY_PRF_WH:-0.000000}
+    time_seconds_in_sav=${TIME_SECONDS_IN_SAV:-0}
+    time_seconds_in_bal=${TIME_SECONDS_IN_BAL:-0}
+    time_seconds_in_prf=${TIME_SECONDS_IN_PRF:-0}
+    
+    export last_snapshot_timestamp last_snapshot_charge_mah last_snapshot_voltage_mv
+    export cumulative_energy_sav_wh cumulative_energy_bal_wh cumulative_energy_prf_wh
+    export time_seconds_in_sav time_seconds_in_bal time_seconds_in_prf
+    
+    # Load prediction state variables for the self-correcting engine
+    # These must be GLOBAL variables to persist across the main loop cycles!
+    prediction_offset=${PREDICTION_OFFSET:-0}
+    prediction_time=${PREDICTION_TIME:-0}
+    prediction_avg=${PREDICTION_AVG:-0}
+    trend_confidence=${TREND_CONFIDENCE:-50}
+    prediction_hits=${PREDICTION_HITS:-0}
+    prediction_total=${PREDICTION_TOTAL:-0}
+    proactive_switch_count=${PROACTIVE_SWITCHES:-0}
+    
+    # Export variables to make them safely available in the parent shell environment
+    export longterm_avg adapt_thr_low adapt_thr_high optimal_low optimal_offset
+    export last_state last_profile_score prediction_offset prediction_time prediction_avg
+    export trend_confidence prediction_hits prediction_total proactive_switch_count
+    
+    # Restore the adaptive learning interval length from the previous daemon session
+    if [ -n "$LEARNING_INTERVAL" ] && [ "$LEARNING_INTERVAL" -gt 0 ]; then
+        optimal_update_interval=$LEARNING_INTERVAL
+    fi
+    
+    # Parse HIT_PATTERN lines (compact format: SCORES + HITS + TARGET_PROFILE on one line)
+    permanent_pattern_count=${HIT_PATTERN_COUNT:-0}
+    if [ "$permanent_pattern_count" -gt 0 ]; then
+        while IFS= read -r line; do
+            # Expected pattern structure: HIT_PATTERN_X_SCORES='scores' HITS=N TARGET_PROFILE='profile'
+            if echo "$line" | grep -q "^HIT_PATTERN_.*_SCORES="; then
+                # POSIX compliance fix: Added explicit trailing semicolons before 'p' actions 
+                # to prevent command-line execution errors on standard POSIX sed engines.
+                pattern_num=$(echo "$line" | sed -n "s/^HIT_PATTERN_\([0-9]*\)_SCORES.*/\1/;p")
+                scores=$(echo "$line" | sed -n "s/^HIT_PATTERN_[0-9]*_SCORES='\([^']*\)'.*/\1/;p")
+                hits=$(echo "$line" | sed -n "s/.*HITS=\([0-9]*\).*/\1/;p")
+                profile=$(echo "$line" | sed -n "s/.*TARGET_PROFILE='\([^']*\)'.*/\1/;p")
+                
+                # Dynamic fallbacks for data consistency
+                [ -z "$hits" ] && hits=0
+                [ -z "$pattern_num" ] && continue
+                
+                # Assign values dynamically to global runtime workspace variables
+                eval "hit_pattern_${pattern_num}_scores='$scores'"
+                eval "hit_pattern_${pattern_num}_hits=$hits"
+                eval "hit_pattern_${pattern_num}_target_profile='$profile'"
+            fi
+        done < "$state_file"
+    fi
+    
+    # Restore candidate processing structures into memory
+    load_candidates
+}
+
+load_candidates() {
+    # Load candidate sequences from candidates.conf (with IN-MEMORY CACHING)
+    local state_tmp_file="/var/lib/tlp/candidates.conf"
+    
+    # Only load from disk on first call
+    if [ "$candidates_cache_loaded" -eq 1 ]; then
+        # Reload candidates_list from cache
+        candidates_list="$candidates_cache"
+        return 0
+    fi
+    
+    candidates_cache=""
+    candidates_list=""
+    
+    if [ ! -f "$state_tmp_file" ]; then
+        candidates_cache_loaded=1
+        return 0
+    fi
+    
+    # Read entire file into cache (once, on first load)
+    candidates_cache=$(cat "$state_tmp_file" 2>/dev/null)
+    candidates_cache_loaded=1
+    candidates_list="$candidates_cache"
+}
+
+cleanup_redundant_candidates() {
+    # Remove candidates that match existing permanent patterns with ≥80% similarity
+    # This prevents accumulation of redundant patterns in candidates.conf
+    # Uses IN-MEMORY-CACHE for efficiency
+    
+    if [ "$permanent_pattern_count" -eq 0 ]; then
+        # No permanent patterns yet, nothing to clean
+        return 0
+    fi
+    
+    if [ -z "$candidates_cache" ]; then
+        return 0
+    fi
+    
+    local new_cache=""
+    local removed=0
+    local kept=0
+    
+    # Process each candidate line from cache
+    while IFS= read -r candidate_line; do
+        [ -z "$candidate_line" ] && continue
+        
+        # Parse candidate: SEQUENCE:PROFILE
+        candidate_sequence="${candidate_line%:*}"
+        candidate_profile="${candidate_line#*:}"
+        
+        local is_redundant=0
+        
+        # Compare against all permanent patterns
+        for i in $(seq 1 "$permanent_pattern_count"); do
+            eval "pattern_scores=\$hit_pattern_${i}_scores"
+            eval "pattern_profile=\$hit_pattern_${i}_target_profile"
+            
+            # Only compare same profile
+            if [ "$pattern_profile" = "$candidate_profile" ]; then
+                similarity=$(calculate_candidate_similarity "$candidate_sequence" "$pattern_scores")
+                
+                if [ "$similarity" -ge 70 ]; then
+                    is_redundant=1
+                    break
+                fi
+            fi
+        done
+        
+        if [ "$is_redundant" -eq 0 ]; then
+            # Keep this candidate in cache
+            if [ -z "$new_cache" ]; then
+                new_cache="$candidate_line"
+            else
+                new_cache="${new_cache}
+${candidate_line}"
+            fi
+            kept=$((kept + 1))
+        else
+            removed=$((removed + 1))
+        fi
+    done <<EOF
+$candidates_cache
+EOF
+    
+    # Update cache and write to disk
+    candidates_cache="$new_cache"
+    candidates_list="$new_cache"
+    echo "$new_cache" > "/var/lib/tlp/candidates.conf" 2>/dev/null
+    
+    if [ "$removed" -gt 0 ]; then
+        echo_debug "power-saver" "CLEANUP COMPLETE: Removed $removed redundant candidates, kept $kept"
+    fi
+}
+
+save_candidates() {
+    # Save candidate sequences to candidates.conf (with IN-MEMORY CACHING)
+    # Simple format: one sequence per line (SEQUENCE:PROFILE format)
+    local state_tmp_file="/var/lib/tlp/candidates.conf"
+    local sequence_to_save="$1"
+    
+    if [ -z "$sequence_to_save" ]; then
+        return 0
+    fi
+    
+    # Update in-memory cache first (ensures consistency across function calls without needing to read from disk)
+    if [ -z "$candidates_cache" ]; then
+        candidates_cache="$sequence_to_save"
+    else
+        candidates_cache="${candidates_cache}
+${sequence_to_save}"
+    fi
+    
+    # Update global candidates_list for consistency
+    candidates_list="$candidates_cache"
+    
+    # Immediately write updated cache to disk (ensures persistence across restarts)
+    echo "$candidates_cache" > "$state_tmp_file" 2>/dev/null
+}
+
+check_and_manage_candidates() {
+    # Track profile changes and store the LAG SEQUENCES that PRECEDE them
+    # When a profile switch occurs, store the lag history that led to it
+    # Then recognize similar sequences BEFORE the switch happens
+    
+    local current_profile="$1"      # The profile we just switched to (SAV/BAL/PRF)
+    local switch_sequence="$2"      # The lag sequence that triggered this switch
+    
+    if [ -z "$switch_sequence" ]; then
+        # No sequence provided (e.g., startup), skip
+        return
+    fi
+    
+    # Keep only last 10 samples (critical switch moment, not entire history)
+    # This ensures patterns are consistent length regardless of how long profile was active
+    local trimmed_sequence
+    trimmed_sequence=$(echo "$switch_sequence" | tr ',' '\n' | tail -n 10 | paste -sd ',' -)
+    switch_sequence="$trimmed_sequence"
+    
+    # Count actual scores available
+    local score_count
+    score_count=$(echo "$switch_sequence" | tr ',' '\n' | wc -l)
+    
+    # For very short sequences (< 4 scores), skip - too noisy
+    if [ "$score_count" -lt 4 ]; then
+        return
+    fi
+    
+    # For sequences < 10 scores, pad with zeros to reach 10 samples
+    # This represents "rapid escalation without subsequent development"
+    # Example: 99,99,99 (3 samples) → 99,99,99,0,0,0,0,0,0,0 (10 samples with padding)
+    if [ "$score_count" -lt 10 ]; then
+        local padding_count=$((10 - score_count))
+        for j in $(seq 1 "$padding_count"); do
+            switch_sequence="$switch_sequence,0"
+        done
+    fi
+    
+    # Check if this switch pattern matches any known permanent patterns
+    local pattern_matched=0
+    
+    if [ "$permanent_pattern_count" -gt 0 ]; then
+        for i in $(seq 1 "$permanent_pattern_count"); do
+            eval "pattern_scores=\$hit_pattern_${i}_scores"
+            eval "pattern_profile=\$hit_pattern_${i}_target_profile"
+            
+            # Only match patterns for the same target profile
+            if [ "$pattern_profile" != "$current_profile" ]; then
+                continue
+            fi
+            
+            local similarity
+            similarity=$(calculate_candidate_similarity "$switch_sequence" "$pattern_scores")
+            
+            if [ "$similarity" -ge 90 ]; then
+                # Increment hit count for recognized switch pattern
+                eval "hit_pattern_${i}_hits=\$((hit_pattern_${i}_hits + 1))"
+                pattern_matched=1
+                break
+            fi
+        done
+    fi
+    
+    # If no permanent pattern matched, check candidates
+    if [ "$pattern_matched" -eq 0 ] && [ -n "$candidates_list" ]; then
+        # Iterate over each candidate line (SEQUENCE:PROFILE format)
+        while IFS= read -r candidate_line; do
+            [ -z "$candidate_line" ] && continue
+            
+            # Parse SEQUENCE:PROFILE format
+            candidate_sequence="${candidate_line%:*}"
+            candidate_profile="${candidate_line#*:}"
+            
+            # Only match candidates for the same target profile
+            if [ "$candidate_profile" != "$current_profile" ]; then
+                continue
+            fi
+            
+            similarity=$(calculate_candidate_similarity "$switch_sequence" "$candidate_sequence")
+            
+            if [ "$similarity" -ge 90 ]; then
+                echo_debug "power-saver" "Candidate switch pattern MATCHED! Similarity: $similarity%, promoting to permanent"
+                
+                # Promote candidate to permanent
+                promote_candidate_to_permanent "$candidate_sequence" "$candidate_profile"
+                pattern_matched=1
+                break
+            fi
+        done << EOF
+$candidates_list
+EOF
+    fi
+    
+    # If no match, check if this new candidate is too similar to existing candidates
+    if [ "$pattern_matched" -eq 0 ]; then
+        local is_duplicate=0
+        
+        if [ -n "$candidates_list" ]; then
+            while IFS= read -r candidate_line; do
+                [ -z "$candidate_line" ] && continue
+                
+                # Parse candidate: SEQUENCE:PROFILE
+                candidate_sequence="${candidate_line%:*}"
+                candidate_profile="${candidate_line#*:}"
+                
+                # Only compare same profile
+                if [ "$candidate_profile" = "$current_profile" ]; then
+                    similarity=$(calculate_candidate_similarity "$switch_sequence" "$candidate_sequence")
+                    
+                    if [ "$similarity" -ge 90 ]; then
+                        is_duplicate=1
+                        break
+                    fi
+                fi
+            done << EOF
+$candidates_list
+EOF
+        fi
+        
+        if [ "$is_duplicate" -eq 0 ]; then
+            echo_debug "power-saver" "New switch pattern for $current_profile, storing as candidate"
+            save_candidates "${switch_sequence}:${current_profile}"
+        fi
+    fi
+}
+
+predict_upcoming_switch() {
+    # Check if current lag sequence matches any KNOWN switch patterns
+    # If match found, system knows a switch is coming and can initiate it early
+    # Returns: "PATTERN_NUMBER|PROFILE" (e.g., "4|BAL") if match found, empty otherwise
+    
+    local current_sequence="$1"  # Current lag scores (comma-separated)
+    local current_profile="$2"   # Current active profile    
+    
+    if [ -z "$current_sequence" ]; then
+        return
+    fi
+    
+    # Check against all permanent switch patterns
+    if [ "$permanent_pattern_count" -gt 0 ]; then
+        local i=1
+        while [ "$i" -le "$permanent_pattern_count" ]; do
+            eval "pattern_scores=\$hit_pattern_${i}_scores"
+            eval "target_profile=\$hit_pattern_${i}_target_profile"
+            eval "hits=\$hit_pattern_${i}_hits"
+            
+            # Skip patterns for current profile (looking for incoming switches)
+            if [ "$target_profile" != "$current_profile" ]; then
+                
+                similarity=$(calculate_candidate_similarity "$current_sequence" "$pattern_scores")
+                
+                if [ "$similarity" -ge 90 ]; then
+                    # Return pattern number and target profile so caller can use correct info
+                    echo "${i}|${target_profile}"
+                    return
+                fi
+            fi
+            
+            i=$((i + 1))
+        done
+    fi
+}
+
+calculate_candidate_similarity() {
+    # Compare two lag score patterns with tolerance (±3 points per sample)
+    # Returns: similarity percentage (0-100)
+    
+    local pattern1="$1"  # Comma-separated scores
+    local pattern2="$2"  # Comma-separated scores
+    
+    if [ -z "$pattern1" ] || [ -z "$pattern2" ]; then
+        echo 0
+        return
+    fi
+    
+    # Single awk call compares both patterns with ±3 tolerance
+    awk -v p1="$pattern1" -v p2="$pattern2" 'BEGIN {
+        # Split both patterns by comma
+        n1 = split(p1, a1, ",")
+        n2 = split(p2, a2, ",")
+        
+        matches = 0
+        total = 0
+        
+        # Compare each score pair
+        for (i = 1; i <= n1 && i <= n2; i++) {
+            total++
+            
+            # Calculate absolute difference
+            diff = a1[i] - a2[i]
+            if (diff < 0) diff = -diff
+            
+            # Check ±3 tolerance
+            if (diff <= 3) {
+                matches++
+            }
+        }
+        
+        # Return percentage
+        if (total > 0) {
+            percentage = (matches * 100) / total
+            # Round to integer
+            printf "%d\n", percentage
+        } else {
+            print 0
+        }
+    }'
+}
+
+promote_candidate_to_permanent() {
+    # Promote a candidate switch pattern to permanent storage (with IN-MEMORY CACHING)
+    # Directly update cache and files
+    
+    local sequence="$1"
+    local profile="$2"
+    
+    if [ -z "$sequence" ] || [ -z "$profile" ]; then
+        echo_debug "power-saver" "ERROR: promote requires sequence and profile"
+        return 1
+    fi
+    
+    # Check if this exact sequence already exists in cache
+    if echo "$psd_state_cache" | grep -q "HIT_PATTERN_.*_SCORES='$sequence'" 2>/dev/null; then
+        echo_debug "power-saver" "DUPLICATE PREVENTED: Sequence already exists as permanent pattern"
+        
+        # Still remove from candidates cache to avoid re-promoting
+        local escaped_sequence
+        escaped_sequence=$(echo "$sequence" | sed 's/[[\.*^$/]/\\&/g')
+        candidates_cache=$(echo "$candidates_cache" | grep -v "^${escaped_sequence}:${profile}$" 2>/dev/null || true)
+        candidates_list="$candidates_cache"
+        # Write updated cache to disk
+        echo "$candidates_cache" > "/var/lib/tlp/candidates.conf" 2>/dev/null
+        return 0
+    fi
+    
+    # Increment counter for next pattern
+    permanent_pattern_count=$((permanent_pattern_count + 1))
+    
+    # Add new pattern to in-memory cache (formatted for both cache and file)
+    local new_pattern_line="HIT_PATTERN_${permanent_pattern_count}_SCORES='$sequence' HITS=2 TARGET_PROFILE='$profile'"
+    if [ -z "$psd_state_cache" ]; then
+        psd_state_cache="$new_pattern_line"
+    else
+        psd_state_cache="${psd_state_cache}
+${new_pattern_line}"
+    fi
+    
+    # Update HIT_PATTERN_COUNT in cache
+    psd_state_cache=$(echo "$psd_state_cache" | sed "s/^HIT_PATTERN_COUNT=.*/HIT_PATTERN_COUNT=$permanent_pattern_count/" || echo "$psd_state_cache
+HIT_PATTERN_COUNT=$permanent_pattern_count")
+    
+    # Initialize shell variables for newly promoted pattern (required by save_psd_state)
+    eval "hit_pattern_${permanent_pattern_count}_scores='$sequence'"
+    eval "hit_pattern_${permanent_pattern_count}_hits=2"
+    eval "hit_pattern_${permanent_pattern_count}_target_profile='$profile'"
+    export hit_pattern_${permanent_pattern_count}_scores
+    export hit_pattern_${permanent_pattern_count}_hits
+    export hit_pattern_${permanent_pattern_count}_target_profile
+    
+    # Remove the promoted sequence from candidates cache
+    local escaped_sequence
+    escaped_sequence=$(echo "$sequence" | sed 's/[[\.*^$/]/\\&/g')
+    candidates_cache=$(echo "$candidates_cache" | grep -v "^${escaped_sequence}:${profile}$" 2>/dev/null || true)
+    candidates_list="$candidates_cache"
+    
+    # Write updated candidates cache to disk immediately (ensures persistence and prevents duplicates)
+    echo "$candidates_cache" > "/var/lib/tlp/candidates.conf" 2>/dev/null
+    
+    # Save formatted state to disk (includes new permanent pattern)
+    save_psd_state
+}
+
+calculate_optimal_sav_threshold() {
+    # Calculate optimal SAV/BAL threshold based on historical load distribution
+    # Goal: maximize time in SAV profile while maintaining responsiveness
+    # Heuristic: set SAV threshold where ~75-80% of samples fall below it
+    
+    # Requires: CUMULATIVE_BUCKET_0_5, etc. (persistent cumulative values from state file)
+    # Returns: new recommended low threshold (5, 8, 10, or 12)
+    
+    # Use cumulative bucket sum, not HISTORY_COUNT (which is only current window)
+    local total_samples=$((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0} + ${CUMULATIVE_BUCKET_20plus:-0}))
+    
+    if [ "$total_samples" -lt 5 ]; then
+        # Not enough data - need at least 5 cumulative samples
+        echo 5
+        return
+    fi
+    
+    local percent_0_5=$(( ${CUMULATIVE_BUCKET_0_5:-0} * 100 / total_samples))
+    local percent_0_10=$(( (${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0}) * 100 / total_samples))
+    local percent_0_15=$(( (${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0}) * 100 / total_samples))
+
+    # Decision tree: recommend threshold based on typical load pattern
+    if [ "$percent_0_5" -ge 70 ]; then
+        # Most samples are below 5 → aggressive power savings possible
+        echo 8
+    elif [ "$percent_0_10" -ge 75 ]; then
+        # 75% below 10 → safe to raise threshold to 8-10
+        echo 10
+    elif [ "$percent_0_15" -ge 75 ]; then
+        # 75% below 15 → conservative raise to 12
+        echo 12
+    else
+        # No clear optimization opportunity
+        echo 5
+    fi
+}
+
+calculate_optimal_threshold_offset() {
+    # Calculate optimal THRESHOLD_OFFSET based on workload distribution volatility
+    # Goal: adapt offset to system's natural load variability
+    # 
+    # High volatility (wide spread) → larger offset (robust)
+    # Low volatility (concentrated) → smaller offset (responsive)
+    #
+    # Uses bucket distribution to determine volatility
+    # Returns: new recommended OFFSET (8, 12, or 16)
+    
+    local total_samples=$((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0} + ${CUMULATIVE_BUCKET_20plus:-0}))
+    
+    if [ $total_samples -lt 5 ]; then
+        # Not enough data, use default
+        echo "$SAV_DYNAMIC_THRESHOLD_OFFSET"
+        return
+    fi
+    
+    # Find the dominant bucket (highest concentration)
+    local max_bucket="${CUMULATIVE_BUCKET_0_5:-0}"
+    [ "${CUMULATIVE_BUCKET_5_10:-0}" -gt "$max_bucket" ] && max_bucket="${CUMULATIVE_BUCKET_5_10:-0}"
+    [ "${CUMULATIVE_BUCKET_10_15:-0}" -gt "$max_bucket" ] && max_bucket="${CUMULATIVE_BUCKET_10_15:-0}"
+    [ "${CUMULATIVE_BUCKET_15_20:-0}" -gt "$max_bucket" ] && max_bucket="${CUMULATIVE_BUCKET_15_20:-0}"
+    [ "${CUMULATIVE_BUCKET_20plus:-0}" -gt "$max_bucket" ] && max_bucket="${CUMULATIVE_BUCKET_20plus:-0}"
+    
+    # Calculate concentration percentage (how much is in the dominant bucket)
+    local concentration=$((max_bucket * 100 / total_samples))
+    
+    # Decision tree: recommend offset based on concentration
+    # High concentration = stable load = tight offset (responsive)
+    # Low concentration = volatile load = loose offset (robust against spikes)
+    if [ "$concentration" -ge 70 ]; then
+        # Very stable load → tight, responsive thresholds
+        echo 8
+    elif [ "$concentration" -ge 50 ]; then
+        # Moderate volatility → balanced thresholds
+        echo 12
+    else
+        # High volatility → loose, robust thresholds
+        echo 16
+    fi
+}
+
+evaluate_prediction() {
+    # Staged evaluation: Quality of predictions improves with more data
+    # Multiple evaluation milestones for confidence building based on sample count
+    # Compares PREDICTION_AVG (what we predicted) with current LONGTERM_AVG
+    # Applies graduated confidence boost scaled by data density
+    #
+    # Evaluation stages (time-based with dynamic sample thresholds):
+    #   Early stage  (+5% for correct, -10% for wrong)
+    #   Mid stage    (+10% for correct, -15% for wrong)
+    #   Late stage   (+15% for correct, -20% for wrong)
+    #   Full stage   (+20% for correct, -25% for wrong)
+    # Sample thresholds depend on SAV_DYNAMIC_INTERVAL and SAV_DYNAMIC_SAMPLES (dynamically calculated)
+    
+    if [ -z "$prediction_time" ] || [ "$prediction_time" -eq 0 ]; then
+        # No previous prediction made yet, skip evaluation
+        echo_debug "power-saver" "[EVAL] SKIP: No prediction made yet (prediction_time=$prediction_time)"
+        return
+    fi
+    
+    local error=$((longterm_avg - prediction_avg))
+    local abs_error="$error"
+    if [ "$error" -lt 0 ]; then
+        abs_error=$(( -error ))
+    fi
+    
+    # Calculate HISTORY_COUNT from cumulative bucket data (persistent across daemon restarts!)
+    # NOT from current longterm_buf (which is only the sliding window for current session)
+    local bucket_total=$((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0} + ${CUMULATIVE_BUCKET_20plus:-0}))
+    HISTORY_COUNT=$bucket_total
+    
+    # Determine evaluation stage based on cumulative historical sample count (reflects data quality across daemon sessions)
+    # Stages are time-based with dynamically calculated thresholds
+    local stage="early"
+    local confidence_boost=5
+    local confidence_penalty=10
+    
+    # Dynamic thresholds: EVAL_EARLY_THRESHOLD, EVAL_MID_THRESHOLD, EVAL_LATE_THRESHOLD, EVAL_FULL_THRESHOLD
+    # Calculated as: SAV_DYNAMIC_LONGTERM_PERIOD/INTERVAL, SAV_DYNAMIC_LONGTERM_PERIOD/INTERVAL, SAV_DYNAMIC_LONGTERM_PERIOD/INTERVAL, SAV_DYNAMIC_LONGTERM_PERIOD/INTERVAL
+    if [ "$HISTORY_COUNT" -ge "$EVAL_FULL_THRESHOLD" ]; then
+        stage="full"        
+        confidence_boost=20
+        confidence_penalty=25
+    elif [ "$HISTORY_COUNT" -ge "$EVAL_LATE_THRESHOLD" ]; then
+        stage="late"        
+        confidence_boost=15
+        confidence_penalty=20
+    elif [ "$HISTORY_COUNT" -ge "$EVAL_MID_THRESHOLD" ]; then
+        stage="mid"         
+        confidence_boost=10
+        confidence_penalty=15
+    elif [ "$HISTORY_COUNT" -ge "$EVAL_EARLY_THRESHOLD" ]; then
+        stage="early"       
+        confidence_boost=5
+        confidence_penalty=10
+    fi
+    
+    # Check if prediction was "good" (within 2 points of actual)
+    if [ "$abs_error" -lt 2 ]; then
+        # Good prediction - increase confidence with stage-based boost
+        prediction_hits=$((prediction_hits + 1))
+        prediction_total=$((prediction_total + 1))
+        trend_confidence=$((trend_confidence + confidence_boost))
+        [ "$trend_confidence" -gt 100 ] && trend_confidence=100
+        echo_debug "power-saver" "[EVAL] CORRECT: predicted_avg=$prediction_avg vs actual_avg=$longterm_avg (error=$error) → TREND_CONFIDENCE=$trend_confidence +$confidence_boost% ($prediction_hits/$prediction_total hits at $stage/$HISTORY_COUNT samples)"
+    else
+        # Bad prediction - decrease confidence with stage-based penalty
+        # Worse predictions at later stages → bigger penalty (should have learned by then!)
+        local actual_penalty=$confidence_penalty
+        if [ "$abs_error" -ge 5 ]; then
+            prediction_total=$((prediction_total + 1))
+            # Very wrong (error >= 5 points) → amplify penalty
+            actual_penalty=$((confidence_penalty + 10))
+        fi
+        trend_confidence=$((trend_confidence - actual_penalty))
+        [ "$trend_confidence" -lt 0 ] && trend_confidence=0
+        echo_debug "power-saver" "[EVAL] WRONG: predicted_avg=$prediction_avg vs actual_avg=$longterm_avg (error=$error) → TREND_CONFIDENCE=$trend_confidence -$actual_penalty% ($prediction_hits/$prediction_total hits at $stage/$HISTORY_COUNT samples)"
+    fi
+    
+    # Adapt learning interval based on TREND_CONFIDENCE (0-100)
+    # Rule: Higher confidence = longer intervals (less overhead = more energy saved)
+    # Lower confidence = shorter intervals (more frequent re-evaluation for safety)
+    if [ "$prediction_total" -ge 3 ]; then
+        local old_interval="$optimal_update_interval"
+        
+        if [ "$trend_confidence" -ge 75 ]; then
+            # Excellent confidence - very stable system, maximum energy save
+            optimal_update_interval=$((SAV_DYNAMIC_LONGTERM_PERIOD * 4 / 2))  # (EVAL_FULL_THRESHOLD samples @ current INTERVAL)
+        elif [ "$trend_confidence" -ge 50 ]; then
+            # Moderate confidence - neutral position
+            optimal_update_interval=$((SAV_DYNAMIC_LONGTERM_PERIOD * 3 / 2))  # (EVAL_LATE_THRESHOLD samples @ current INTERVAL)
+        elif [ "$trend_confidence" -ge 25 ]; then
+            # Low confidence - uncertain
+            optimal_update_interval=$((SAV_DYNAMIC_LONGTERM_PERIOD * 1 / 2))  # (EVAL_MID_THRESHOLD samples @ current INTERVAL)
+        else
+            # Very low confidence - need frequent evaluation
+            optimal_update_interval=$((SAV_DYNAMIC_LONGTERM_PERIOD * 2 / 3)) # (EVAL_EARLY_THRESHOLD samples @ current INTERVAL)
+        fi
+
+        optimal_update_interval=$(( ((optimal_update_interval + 59) / 60) * 60 ))
+        
+        if [ "$old_interval" -ne "$optimal_update_interval" ]; then
+            echo_debug "power-saver" "Learning interval adapted: TREND_CONFIDENCE=$trend_confidence% → interval=${optimal_update_interval}s (was ${old_interval}s) [stage=$stage]"
+        fi
+    fi
+    
+    # Export stage to global variable so save_psd_state() can access it
+    STAGE=$stage
+    
+    # Variables are already global and were exported at load time in load_psd_state()
+    # No need to export again - changes to globals are visible to save_psd_state()
+    echo_debug "power-saver" "[EVAL] Updated globals: TREND_CONFIDENCE=$trend_confidence, PREDICTION_HITS=$prediction_hits, PREDICTION_TOTAL=$prediction_total, STAGE=$STAGE"
+}
+
+make_prediction() {
+    # Makes a new prediction for the next period
+    # Adaptive strategy: Use system stability to choose between current-state or trend-based prediction
+    # Stores prediction for later evaluation
+    
+    # Calculate trend: does load seem to be increasing or decreasing?
+    local trend=0
+    if [ "$longterm_avg" -gt "$last_profile_score" ]; then
+        trend=$((longterm_avg - last_profile_score))  # Load increasing
+        echo_debug "power-saver" "Trend: INCREASING (now=$longterm_avg, was=$last_profile_score)"
+    elif [ "$longterm_avg" -lt "$last_profile_score" ]; then
+        trend=$((longterm_avg - last_profile_score))  # Negative = decreasing
+        echo_debug "power-saver" "Trend: DECREASING (was=$last_profile_score, now=$longterm_avg)"
+    else
+        echo_debug "power-saver" "Trend: STABLE (was=$last_profile_score, now=$longterm_avg)"
+    fi
+    
+    local new_predicted_avg
+    
+    # Adaptive prediction strategy based on system stability
+    # Stable system (small trend) = predict current load will continue (most accurate for steady workloads)
+    # Volatile system (large trend) = use trend-based prediction (anticipate changes)
+    if [ "$trend" -lt 3 ] && [ "$trend" -gt -3 ]; then
+        # STABLE MODE: System is stable, predict current load continues
+        # This is more accurate for steady workloads and avoids overreacting to minor fluctuations
+        new_predicted_avg=$longterm_avg
+    else
+        # TREND MODE: System is changing, apply trend adjustment weighted by confidence
+        # Higher confidence = trust the trend more
+        local trend_adjustment=$((trend * trend_confidence / 100))
+        new_predicted_avg=$((longterm_avg + trend_adjustment))
+    fi
+    
+    # Clamp prediction to reasonable bounds (0-95)
+    if [ "$new_predicted_avg" -lt 0 ]; then
+        new_predicted_avg=0
+    elif [ "$new_predicted_avg" -gt 95 ]; then
+        new_predicted_avg=95
+    fi
+    
+    # Calculate what offset we predict based on this load
+    # (This is what calculate_optimal_threshold_offset would return for predicted_avg)
+    local predicted_offset="$optimal_offset"
+    
+    # Store prediction
+    prediction_avg=$new_predicted_avg
+    prediction_offset=$predicted_offset
+    prediction_time=$(date +%s)
+    # prediction_total is incremented in evaluate_prediction() when we EVALUATE the prediction
+    # Incrementing here would double-count: once for making the prediction, once for evaluating it
+}
+
+cleanup_daemon() {
+    # Clean up on daemon shutdown: reactivate all CPU cores and save state
+    # This ensures system is left in full-performance state when daemon exits
+    
+    # Ensure optimal_low has a value before saving
+    if [ -z "$optimal_low" ]; then
+        optimal_low=5
+    fi
+    
+    local cpu_online_dir="/sys/devices/system/cpu"
+    local total_cores=0
+    local activated=0
+    
+    # Only save state if we actually learned something (have enough history)
+    # This prevents overwriting existing learned state if daemon crashes at startup
+    local history_count
+    history_count=$(echo "$longterm_buf" | wc -w)
+    if [ "$history_count" -ge 2 ]; then
+        # We have enough data, save it safely
+        save_psd_state
+    else
+        # Minimal or no history - preserve existing state file on disk
+        echo_debug "power-saver" "Daemon stopped before learning (${history_count} samples) - preserving existing state"
+    fi
+    
+    # Count total CPU cores
+    for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
+        if [ -f "$cpu_online" ]; then
+            total_cores=$((total_cores + 1))
+        fi
+    done
+    
+    # Force activation of all offline cores
+    if [ "$total_cores" -gt 0 ]; then
+        echo_debug "power-saver" "Daemon shutdown: reactivating all CPU cores..."
+        for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
+            if [ -f "$cpu_online" ] && [ -w "$cpu_online" ]; then
+                echo 1 > "$cpu_online" 2>/dev/null && activated=$((activated + 1))
+            fi
+        done
+        echo_debug "power-saver" "Daemon shutdown: reactivated all $((total_cores + 1)) CPU cores"
+        
+        # Also reactivate all cores via Cgroups cpuset.cpus
+        local all_cores_mask="$total_cores"
+        write_cpuset_mask "0-$all_cores_mask"
+    fi
+    
+    # Stop scx-p2dq
+    stop_scx_p2dq
+    
+    # Remove PID file
+    remove_pidfile
 }
 
 run_loop() {
@@ -294,7 +2177,7 @@ run_loop() {
     # (skip if already loaded via tlp.in)
     if ! command -v echo_debug >/dev/null 2>&1; then
         # Try standard installation paths
-        for tlib in /usr/share/tlp /opt/tlp /usr/local/share/tlp; do
+        for tlib in /usr/share/tlp; do
             if [ -f "$tlib/tlp-func-base" ]; then
                 TLPPATH="$tlib"
                 break
@@ -308,16 +2191,15 @@ run_loop() {
         
         # Source common functions - tlp-func-base must be sourced first
         for lib in "$TLPPATH/tlp-func-base" "$TLPPATH/func.d/10-tlp-func-cpu"; do
-            # shellcheck disable=SC1090
             . "$lib" || { echo "Error: Failed to source $lib"; exit 1; }
         done
     fi
-
+    
     # Load configuration files - always needed for TLP_PROFILE_BAT and other settings
     # (regardless of whether echo_debug was already available)
     if [ -z "$TLPPATH" ]; then
         # Find TLP path if not already set
-        for tlib in /usr/share/tlp /opt/tlp /usr/local/share/tlp; do
+        for tlib in /usr/share/tlp; do
             if [ -f "$tlib/tlp-func-base" ]; then
                 TLPPATH="$tlib"
                 break
@@ -327,20 +2209,17 @@ run_loop() {
     
     if [ -n "$TLPPATH" ]; then
         if [ -f "$TLPPATH/defaults.conf" ]; then
-            # shellcheck disable=SC1090
             . "$TLPPATH/defaults.conf" || echo "Warning: Failed to source defaults.conf"
         fi
     fi
     
     if [ -f "/etc/tlp.conf" ]; then
-        # shellcheck disable=SC1090
         . "/etc/tlp.conf" || echo "Warning: Failed to source /etc/tlp.conf"
     fi
     
     # Source all config files in /etc/tlp.d/ directory
     for conf_file in /etc/tlp.d/*.conf; do
         if [ -f "$conf_file" ]; then
-            # shellcheck disable=SC1090
             . "$conf_file" || echo "Warning: Failed to source $conf_file"
         fi
     done
@@ -350,7 +2229,13 @@ run_loop() {
     # Setup signal handlers for graceful shutdown
     shutdown=false
     trap 'shutdown=true' TERM INT
-    trap 'remove_pidfile' EXIT
+    trap 'cleanup_daemon' EXIT
+    
+    # Setup signal handlers for cache management
+    # SIGHUP: Reload cache from disk (external tools may have modified state files)
+    # SIGUSR1: Force immediate save of current state to disk
+    trap 'handle_sighup' HUP
+    trap 'handle_sigusr1' USR1
 
     # Check if profile saver is enabled
     POWER_SAVER_ENABLE=${POWER_SAVER_ENABLE:-0}
@@ -358,57 +2243,247 @@ run_loop() {
         echo_debug "power-saver" "disabled (POWER_SAVER_ENABLE=$POWER_SAVER_ENABLE)"
         exit 0
     fi
+    
+    # Load previous daemon state (learning from past history)
+    load_psd_state
+    
+    # Clean up redundant candidates (only called by daemon, not by read-only commands like display_status)
+    # This ensures candidates.conf is cleaned during daemon startup, not during status queries
+    cleanup_redundant_candidates
+    
+    # Initialize candidate and permanent pattern variables if not already loaded
+    permanent_pattern_count=${permanent_pattern_count:-0}
+    candidate_pattern_count=${candidate_pattern_count:-0}
+    
+    # Recalculate HISTORY_COUNT from restored history if available
+    if [ -n "$HISTORY_SCORES" ]; then
+        HISTORY_COUNT=$(echo "$HISTORY_SCORES" | tr ',' '\n' | wc -l)
+    else
+        HISTORY_COUNT=${HISTORY_COUNT:-0}
+    fi
+    
+    # Don't re-initialize CUMULATIVE_BUCKET variables!
+    # They are already loaded by load_psd_state() from the persistent state file.
+    # Re-initializing them here would reset them to 0 if the state file doesn't contain them yet.
+    # Instead: ensure they are exported so child processes see them.
+    export CUMULATIVE_BUCKET_0_5 CUMULATIVE_BUCKET_5_10 CUMULATIVE_BUCKET_10_15 CUMULATIVE_BUCKET_15_20 CUMULATIVE_BUCKET_20plus
 
     # Configuration: use values from config files or defaults
-    INTERVAL=${SAV_DYNAMIC_INTERVAL:-4}
-    SAMPLES=${SAV_DYNAMIC_SAMPLES:-3}
+    INTERVAL=${SAV_DYNAMIC_INTERVAL:-2}
+    SAMPLES=${SAV_DYNAMIC_SAMPLES:-4}
     HYST=${SAV_DYNAMIC_HYSTERESIS:-5}
-    MIND=${SAV_DYNAMIC_MIN_DELAY:-2}
+    MIND=${SAV_DYNAMIC_MIN_DELAY:-3}
     TLP_PROFILE_BAT=${TLP_PROFILE_BAT:-power-saver}
-    
-    # Adaptive threshold configuration
+
     SAV_DYNAMIC_ADAPTIVE=${SAV_DYNAMIC_ADAPTIVE:-1}
-    SAV_DYNAMIC_LONGTERM_PERIOD=${SAV_DYNAMIC_LONGTERM_PERIOD:-60}
-    SAV_DYNAMIC_THRESHOLD_OFFSET=${SAV_DYNAMIC_THRESHOLD_OFFSET:-15}
-    SAV_DYNAMIC_SWITCH_DELTA=${SAV_DYNAMIC_SWITCH_DELTA:-5}
+    SAV_DYNAMIC_SWITCH_DELTA=${SAV_DYNAMIC_SWITCH_DELTA:-4}
+
+    # Adaptive threshold configuration
+    if [ "${PREDICTION_TOTAL:-0}" -gt 0 ]; then
+        prediction_pct=$(((PREDICTION_HITS * 100) / PREDICTION_TOTAL))
+    else
+        prediction_pct=1  # Minimal default to avoid zero division, ensures we still get a longterm period even with no predictions yet
+    fi
+
+    local temp_period    
+    temp_period=$(((TREND_CONFIDENCE + prediction_pct) * INTERVAL))  # Calculate longterm period dynamically based on confidence and prediction accuracy (rounded to nearest minute)
+    temp_period=$((((temp_period + 59) / 60) * 60))
+    
+    SAV_DYNAMIC_LONGTERM_PERIOD=${temp_period:-120}
+    
+    # Calculate evaluation stage thresholds: map time windows to buffer entry counts
+    # The longterm_buf grows by 1 entry every INTERVAL seconds
+    # This ensures stage evaluations remain time-consistent across different INTERVAL settings
+    # Formula: entries_needed = time_window_seconds / INTERVAL
+    EVAL_EARLY_THRESHOLD=$((SAV_DYNAMIC_LONGTERM_PERIOD / INTERVAL / 8)) 
+    EVAL_MID_THRESHOLD=$((SAV_DYNAMIC_LONGTERM_PERIOD / INTERVAL / 4))
+    EVAL_LATE_THRESHOLD=$((SAV_DYNAMIC_LONGTERM_PERIOD / INTERVAL / 2))
+    EVAL_FULL_THRESHOLD=$((SAV_DYNAMIC_LONGTERM_PERIOD / INTERVAL))
+    
+    # Initialize and calculate optimal SAV/BAL threshold
+    optimal_low=${optimal_low:-5}
+    if [ -z "$optimal_low" ] || [ "$optimal_low" = "" ]; then
+        optimal_low=5
+    fi
+    
+    # Initialize optimal_offset with default if not already set
+    optimal_offset=${optimal_offset:-${SAV_DYNAMIC_THRESHOLD_OFFSET:-13}}
+    
+    # Check if we have bucket data (cumulative samples from past runs)
+    bucket_sum=$((${CUMULATIVE_BUCKET_0_5:-0} + ${CUMULATIVE_BUCKET_5_10:-0} + ${CUMULATIVE_BUCKET_10_15:-0} + ${CUMULATIVE_BUCKET_15_20:-0} + ${CUMULATIVE_BUCKET_20plus:-0}))
+    
+    if [ "$HISTORY_COUNT" -ge 5 ] || [ "$bucket_sum" -ge 100 ]; then
+        # We have history data (individual samples or cumulative buckets), calculate optimal thresholds
+        optimal_low=$(calculate_optimal_sav_threshold)
+        optimal_offset=$(calculate_optimal_threshold_offset)
+    else
+        echo_debug "power-saver" "Using default thresholds: optimal_low=$optimal_low, optimal_offset=$optimal_offset (insufficient history: $bucket_sum cumulative samples)"
+    fi
+    
+    # Apply optimized offset to current configuration
+    SAV_DYNAMIC_THRESHOLD_OFFSET=$optimal_offset
 
     # Fallback thresholds (used when adaptive thresholds disabled or insufficient data)
-    # Default: 25,75 - standard profile switching points
-    thr_low=25
+    # Instead of static 25, use the optimized thresholds learned from history
+    thr_low=$optimal_low
     thr_high=75
-
-    last_state="unknown"
+    
+    # Track when we last updated optimal_low calculation
+    last_optimal_update=0  # Initialize to 0 so it updates immediately on first loop iteration
+    optimal_update_interval=${SAV_DYNAMIC_LONGTERM_PERIOD:-120}  # Start with longterm period as initial update interval
+   
+    last_state=${last_state:-"SAV"}
     last_change=0
     last_ac_check=0
+    last_scx_health_check=0
     cached_ac_status=1
     sample_buf=""
     prev_avg=0
-    last_sample_time=$(date +%s)
     current_interval=$INTERVAL
     last_battery_capped=false
-    last_profile_score=0
+    last_profile_score=${last_profile_score:-0}
     
     # Longterm buffer for adaptive thresholds: stores "timestamp:score" pairs
-    longterm_buf=""
+    longterm_buf=${longterm_buf:-""}
     last_adaptive_check=0
-    last_adapt_thr_low=0
-    last_adapt_thr_high=0
+    last_adapt_thr_low=${last_adapt_thr_low:-0}
+    last_adapt_thr_high=${last_adapt_thr_high:-0}
+    longterm_avg=${longterm_avg:-0}
+    
+    # Energy tracking: time spent in each profile since last fullcharge
+    # These accumulate over daemon lifetime and are saved/restored on shutdown/startup
+    time_seconds_in_sav=${time_seconds_in_sav:-0}
+    time_seconds_in_bal=${time_seconds_in_bal:-0}
+    time_seconds_in_prf=${time_seconds_in_prf:-0}
+    profile_start_time=$(date +%s)  # When current profile session started
+    
+    # Energy tracking snapshot: reference point for cumulative energy calculation
+    # These are loaded from state file in load_psd_state()
+    last_snapshot_timestamp=${last_snapshot_timestamp:-0}
+    last_snapshot_charge_mah=${last_snapshot_charge_mah:-0}
+    last_snapshot_voltage_mv=${last_snapshot_voltage_mv:-0}
+    
+    # Check if battery was charged while daemon was offline
+    # If current > snapshot, the snapshot is stale and should be updated
+    if [ "$last_snapshot_charge_mah" -gt 0 ]; then
+        local startup_current_mah
+        startup_current_mah=$(get_battery_charge_mah)
+        if [ "$startup_current_mah" -gt "$last_snapshot_charge_mah" ]; then
+            echo_debug "power-saver" "Energy: Battery charged during daemon downtime (was $last_snapshot_charge_mah mAh, now $startup_current_mah mAh) - updating snapshot"
+            last_snapshot_charge_mah=$startup_current_mah
+            last_snapshot_voltage_mv=$(get_battery_voltage_mv)
+            last_snapshot_timestamp=$(date +%s)
+        fi
+    fi
+    
+    # Switch buffer for pattern recognition: stores lag scores leading to profile switch
+    switch_buf=""
+    
+    # Oscillation prevention: remember last proactive pattern to prevent repeated switching
+    last_proactive_pattern_num=""    # The pattern number we just executed
+    
+    # Prediction system variables: load_psd_state()
+    # Do NOT reinitialize them or we'll lose the saved values!
+    # These variables are set from psd-state.conf in load_psd_state() and exported
+    # - prediction_offset, prediction_time, prediction_avg
+    # - trend_confidence, prediction_hits, prediction_total
+    # - proactive_switch_count
+    
+    # Pattern variables (initialized from load_permanent_patterns/load_candidates)
+    permanent_pattern_count=${permanent_pattern_count:-0}
+    candidate_pattern_count=${candidate_pattern_count:-0}
     
     echo_debug "power-saver" "Starting profile saver daemon"
+    # Start with all CPU cores online until we have enough workload data
+    scale_cpu_cores "$workload" "$profile"
+    
+    # Check AC status immediately on startup (don't wait for first interval)
+    cached_ac_status=$(get_ac_power)
+    if [ "$cached_ac_status" = "1" ]; then
+        echo_debug "power-saver" "AC power detected on startup, stopping daemon"
+        scale_cpu_cores 0 "PRF"
+        exit 0
+    fi
 
     while [ "$shutdown" = false ]; do
         now=$(date +%s)
-        
+
         # Check AC status every 2*INTERVAL to reduce I/O (optimization: cache status)
         if [ $((now - last_ac_check)) -ge $((INTERVAL * 2)) ]; then
             last_ac_check=$now
-            get_sys_power_supply
-            cached_ac_status=$_syspwr
+            cached_ac_status=$(get_ac_power)
         fi
         
-        # Stop daemon on AC power (PS_AC=0)
-        if [ "$cached_ac_status" = "0" ]; then
+        if [ "$cached_ac_status" = "1" ]; then
             echo_debug "power-saver" "switched to AC mode, stopping"
+            exit 0
+        fi
+        
+        # Health check: verify scx_p2dq is still running (every 2*INTERVAL)
+        if [ $((now - last_scx_health_check)) -ge $((INTERVAL * 2)) ]; then
+            last_scx_health_check=$now
+            if ! check_scx_p2dq_health; then
+                start_scx_p2dq
+            fi
+        fi
+        
+        # Periodically recalculate optimal_low and optimal_offset based on current historical data and evaluate prediction accuracy
+        if [ $((now - last_optimal_update)) -ge "$optimal_update_interval" ]; then
+            last_optimal_update=$now
+            
+            # EVALUATE - Check if previous prediction was correct
+            evaluate_prediction
+            
+            # Save PREDICTION_HITS immediately after evaluate_prediction() to avoid data loss
+            # If daemon is killed between evaluate_prediction() and save_psd_state(), the hit count would be lost
+            # This ensures prediction accuracy metrics persist even if daemon crashes
+            save_psd_state
+            
+            # CALCULATE - Compute new optimal parameters
+            new_optimal_low=$(calculate_optimal_sav_threshold)
+            new_optimal_offset=$(calculate_optimal_threshold_offset)
+            
+            if [ "$new_optimal_low" != "$optimal_low" ]; then
+                optimal_low=$new_optimal_low
+                thr_low=$optimal_low
+            fi
+            
+            if [ "$new_optimal_offset" != "$optimal_offset" ]; then
+                optimal_offset=$new_optimal_offset
+                SAV_DYNAMIC_THRESHOLD_OFFSET=$optimal_offset
+            fi
+            
+            # PREDICT - Make prediction for next period weighted by trend_confidence
+            make_prediction
+            
+            # PATTERN RECOGNITION - Check and manage workload patterns (candidates/permanent)
+            # Build current pattern from longterm_buf scores
+            local current_pattern=""
+            for entry in $longterm_buf; do
+                local score="${entry#*:}"
+                if [ -z "$current_pattern" ]; then
+                    current_pattern="$score"
+                else
+                    current_pattern="${current_pattern},${score}"
+                fi
+            done
+
+            current_pattern="${current_pattern%,}"  # Remove trailing comma
+            
+            if [ -n "$current_pattern" ]; then
+                check_and_manage_candidates "$current_pattern"
+            fi
+            
+            # Save state after learning cycle (PREDICTION_HITS already saved above)
+            # This ensures all state variables are persisted
+            save_psd_state
+        fi
+                
+        # Stop daemon on AC power
+        if [ "$cached_ac_status" = "1" ]; then
+            echo_debug "power-saver" "switched to AC mode, activating all CPU cores"
+            scale_cpu_cores 0 "PRF"
+            echo_debug "power-saver" "stopping daemon"
             exit 0
         fi
 
@@ -422,16 +2497,16 @@ run_loop() {
         # This ensures we never under-allocate performance when apps demand it
         if [ "$pm_qos" -ge 0 ]; then
             if [ "$pm_qos" -gt "$pct" ]; then
-                echo_debug "power-saver" "PM QoS boost: lag_score=$pct → $pm_qos"
                 pct=$pm_qos
             fi
         fi
         
         sample_buf="$sample_buf $pct"
-        # keep only last SAMPLES values
+        # Keep only last SAMPLES values
+        # shellcheck disable=2086
         set -- $sample_buf
         count=$#
-        if [ $count -gt $SAMPLES ]; then
+        if [ "$count" -gt "$SAMPLES" ]; then
             # drop oldest
             shift_count=$((count - SAMPLES))
             i=0; newbuf=""
@@ -443,7 +2518,7 @@ run_loop() {
             done
             sample_buf="$newbuf"
         fi
-        # compute average
+        # Compute average
         sum=0; n=0
         for v in $sample_buf; do sum=$((sum+v)); n=$((n+1)); done
         avg=0
@@ -451,7 +2526,6 @@ run_loop() {
 
         # Adaptive interval based on load trend
         # Calculate slope: how fast is load changing?
-        time_delta=$((now - last_sample_time))
         delta_avg=$((avg - prev_avg))
         
         # Default to base interval
@@ -487,23 +2561,125 @@ run_loop() {
         fi
         
         prev_avg=$avg
-        last_sample_time=$now
 
-        # Update longterm buffer for adaptive thresholds (every 10 seconds to avoid overhead)
-        if [ "$SAV_DYNAMIC_ADAPTIVE" = "1" ] && [ $((now - last_adaptive_check)) -ge 10 ]; then
+        # Update longterm buffer for adaptive thresholds and pattern recognition
+        if [ "$SAV_DYNAMIC_ADAPTIVE" = "1" ] && [ $((now - last_adaptive_check)) -ge "${SAV_DYNAMIC_INTERVAL:-2}" ]; then
             last_adaptive_check=$now
             # Add current score with timestamp to longterm buffer
             longterm_buf="$longterm_buf $now:$avg"
+            
+            # Track every sample incrementally, not re-calculate from sliding window
+        
+            if [ "$avg" -lt 5 ]; then 
+                CUMULATIVE_BUCKET_0_5=$((${CUMULATIVE_BUCKET_0_5:-0} + 1))
+            elif [ "$avg" -lt 10 ]; then 
+                CUMULATIVE_BUCKET_5_10=$((${CUMULATIVE_BUCKET_5_10:-0} + 1))
+            elif [ "$avg" -lt 15 ]; then 
+                CUMULATIVE_BUCKET_10_15=$((${CUMULATIVE_BUCKET_10_15:-0} + 1))
+            elif [ "$avg" -lt 20 ]; then 
+                CUMULATIVE_BUCKET_15_20=$((${CUMULATIVE_BUCKET_15_20:-0} + 1))
+            else 
+                CUMULATIVE_BUCKET_20plus=$((${CUMULATIVE_BUCKET_20plus:-0} + 1))
+            fi
+            
+            # Also add to switch buffer (for pattern matching without timestamps)
+            if [ -z "$switch_buf" ]; then
+                switch_buf="$avg"
+            else
+                switch_buf="$switch_buf,$avg"
+            fi
+            
+            # ========== STAGE 1: PROACTIVE SWITCH (HIGH PRIORITY) ==========
+            # Check for strong pattern predictions (HITS≥2)
+            # If found, execute DIRECTLY without threshold checks
+            proactive_matched=0
+            score_count=$(echo "$switch_buf" | tr ',' '\n' | wc -l)
+            
+            # Only consider proactive switching if we're not already in the target profile (e.g. don't switch to BAL if we're already in BAL)
+            # This prevents unnecessary proactive switching when we're already in the most aggressive profile, which could cause oscillations and instability
+            # Only consider proactive switches if we have enough recent data (score_count≥SAMPLES) to ensure pattern recognition is reliable
+            if [ "$last_state" != "SAV" ] && [ "$score_count" -ge "$SAMPLES" ] && [ "$SAMPLES" -gt 0 ]; then
+                # Try to predict upcoming switch
+                predicted=$(predict_upcoming_switch "$switch_buf" "$last_state")
+                if [ -n "$predicted" ]; then
+                    # Parse "PATTERN_NUMBER|PROFILE" format
+                    predicted_num="${predicted%|*}"
+                    predicted_profile="${predicted#*|}"
+                    
+                    # OSCILLATION PREVENTION: Skip only if we already executed THIS pattern recently AND
+                    # we successfully switched to the target profile (still waiting for new workload)
+                    # Check last_state (current profile) not target (computed next profile)
+                    if [ "$predicted_num" = "$last_proactive_pattern_num" ] && [ "$last_state" = "$predicted_profile" ]; then
+                        # Skip PROACTIVE evaluation (already in target), but still allow THRESHOLD logic
+                        proactive_matched=1
+                    elif [ -z "$predicted_num" ]; then
+                        : # Invalid pattern number, skip
+                    else
+                        if [ "$predicted_profile" != "$last_state" ]; then
+                            # Find the matching pattern to verify HITS confidence
+                            eval "pattern_hits=\$hit_pattern_${predicted_num}_hits"
+                            
+                            if [ -n "$pattern_hits" ] && [ "$pattern_hits" -ge 2 ]; then
+                                                             
+                                # Increment pattern hits and proactive switch counter for statistics
+                                eval "hit_pattern_${predicted_num}_hits=\$((hit_pattern_${predicted_num}_hits + 1))"
+                                proactive_switch_count=$((proactive_switch_count + 1))
+                                
+                                # Track time spent in previous profile before switching
+                                if [ -n "$profile_start_time" ] && [ "$profile_start_time" -gt 0 ]; then
+                                    local time_in_profile=$((now - profile_start_time))
+                                    case "$last_state" in
+                                        SAV) time_seconds_in_sav=$((time_seconds_in_sav + time_in_profile)) ;;
+                                        BAL) time_seconds_in_bal=$((time_seconds_in_bal + time_in_profile)) ;;
+                                        PRF) time_seconds_in_prf=$((time_seconds_in_prf + time_in_profile)) ;;
+                                    esac
+                                    profile_start_time=$now
+                                fi
+                                
+                                # Apply profile immediately (don't wait for threshold)
+                                # predicted_profile still contains the target (BAL/PRF)
+                                # With all cores active, apply_profile will decide whether to actually switch or stay in SAV based on current workload
+                                apply_profile "$predicted_profile" "$avg" "PROACTIVE"
+                                
+                                # Record the pattern match (for validation)
+                                check_and_manage_candidates "$predicted_profile" "$switch_buf"
+                                
+                                # Mark state change
+                                last_state="$predicted_profile"
+                                target="$predicted_profile"
+                                last_profile_score="$avg"
+                                
+                                # OSCILLATION PREVENTION: Remember this pattern+time so we skip if it triggers again while still in target profile
+                                last_proactive_pattern_num="$predicted_num"
+                                
+                                # Reset switch buffer after successful proactive switch
+                                switch_buf=""
+                                
+                                # Persist state immediately after successful proactive switch
+                                # This ensures next iteration recognizes we're already in target profile
+                                # and prevents repeated SAV→BAL detection when already in BAL
+                                save_psd_state
+                                
+                                # Skip normal threshold logic (we already switched!)
+                                proactive_matched=1
+                            else
+                                echo_debug "power-saver" "Pattern recognized but low confidence (HITS=${pattern_hits:-?}) - waiting for threshold"
+                            fi
+                        fi
+                    fi
+                fi
+            fi
             
             # Remove old entries (older than LONGTERM_PERIOD)
             cutoff_time=$((now - SAV_DYNAMIC_LONGTERM_PERIOD))
             new_longterm=""
             for entry in $longterm_buf; do
-                entry_time=$(echo "$entry" | cut -d: -f1)
+                entry_time="${entry%%:*}" 
                 if [ "$entry_time" -gt "$cutoff_time" ]; then
                     new_longterm="$new_longterm $entry"
                 fi
             done
+
             longterm_buf="$new_longterm"
             
             # Calculate longterm average if we have enough data
@@ -511,60 +2687,103 @@ run_loop() {
                 lt_sum=0
                 lt_count=0
                 for entry in $longterm_buf; do
-                    score=$(echo "$entry" | cut -d: -f2)
+                    score="${entry#*:}"                    
                     lt_sum=$((lt_sum + score))
                     lt_count=$((lt_count + 1))
                 done
                 
                 if [ $lt_count -gt 0 ]; then
                     longterm_avg=$((lt_sum / lt_count))
+                    
+                    # If longterm_avg is 0, use prediction_avg as fallback to avoid false penalties at startup
+                    if [ "$longterm_avg" -eq 0 ] && [ -n "$prediction_avg" ] && [ "$prediction_avg" -ne 0 ]; then
+                        longterm_avg=$prediction_avg
+                    fi
+                    
                     # Calculate adaptive thresholds
                     adapt_thr_low=$((longterm_avg - SAV_DYNAMIC_THRESHOLD_OFFSET))
                     adapt_thr_high=$((longterm_avg + SAV_DYNAMIC_THRESHOLD_OFFSET))
-                    # Ensure minimum values to avoid weird behavior
-                    [ $adapt_thr_low -lt 5 ] && adapt_thr_low=5
-                    [ $adapt_thr_high -gt 95 ] && adapt_thr_high=95
-                    [ $adapt_thr_low -ge $adapt_thr_high ] && adapt_thr_low=$((adapt_thr_high - 10))
+                    # Ensure minimum and maximum values to avoid weird behavior
+                    if [ $adapt_thr_low -lt 5 ]; then
+                        adapt_thr_low=5
+                    fi
+                    if [ $adapt_thr_high -gt 95 ]; then
+                        adapt_thr_high=95
+                    fi
+                    if [ $adapt_thr_low -ge $adapt_thr_high ]; then
+                        adapt_thr_low=$((adapt_thr_high - 10))
+                        if [ $adapt_thr_low -lt 5 ]; then
+                            adapt_thr_low=5
+                        fi
+                    fi
                 fi
             fi
         fi
 
-        # Use adaptive or static thresholds
-        use_thr_low=$thr_low
-        use_thr_high=$thr_high
-        if [ "$SAV_DYNAMIC_ADAPTIVE" = "1" ] && [ -n "${adapt_thr_low:-}" ]; then
-            use_thr_low=$adapt_thr_low
-            use_thr_high=$adapt_thr_high
-            # Log only when adaptive thresholds change (avoid spam)
-            if [ "$adapt_thr_low" != "$last_adapt_thr_low" ] || [ "$adapt_thr_high" != "$last_adapt_thr_high" ]; then
-                echo_debug "power-saver" "Adaptive thresholds updated: low=$use_thr_low high=$use_thr_high (longterm_avg=$longterm_avg)"
-                last_adapt_thr_low=$adapt_thr_low
-                last_adapt_thr_high=$adapt_thr_high
-            fi
-        fi
-
-        # determine target profile with state-dependent hysteresis
-        # Hysteresis prevents oscillation: once in a state, need stronger trigger to leave
-        # Entry thresholds: use_thr_low and use_thr_high (easy to enter)
-        # Exit thresholds: add/subtract HYST (harder to exit, prevents oscillation)
-        target="BAL"
+        # ========== STAGE 2: THRESHOLD-BASED LOGIC (only if no proactive match) ==========
+        if [ "$proactive_matched" -eq 0 ]; then
+            # Sync target with current actual state to prevent redundant switches
+            # If a proactive switch happened in previous cycle, we're already in new profile
+            target="$last_state"
         
-        if [ "$last_state" = "SAV" ]; then
-            # In SAV: stay until crossing low_threshold + HYST (prevents bouncing back)
-            if [ "$avg" -lt $((use_thr_low + HYST)) ]; then
-                target="SAV"
+            # Use adaptive or static thresholds
+            use_thr_low=$thr_low
+            use_thr_high=$thr_high
+            if [ "$SAV_DYNAMIC_ADAPTIVE" = "1" ] && [ -n "${adapt_thr_low:-}" ]; then
+                use_thr_low=$adapt_thr_low
+                use_thr_high=$adapt_thr_high
+                # Log only when adaptive thresholds change (avoid spam)
+                if [ "$adapt_thr_low" != "$last_adapt_thr_low" ] || [ "$adapt_thr_high" != "$last_adapt_thr_high" ]; then
+                    last_adapt_thr_low=$adapt_thr_low
+                    last_adapt_thr_high=$adapt_thr_high
+                fi
             fi
-        elif [ "$last_state" = "PRF" ]; then
-            # In PRF: stay until crossing high_threshold - HYST (prevents bouncing back)
-            if [ "$avg" -gt $((use_thr_high - HYST)) ]; then
-                target="PRF"
-            fi
-        else
-            # In BAL or unknown: switch to SAV or PRF on threshold crossing
-            if [ "$avg" -lt "$use_thr_low" ]; then
-                target="SAV"
-            elif [ "$avg" -gt "$use_thr_high" ]; then
-                target="PRF"
+
+            # Determine target profile (STAGE 2: Threshold-based Fallback Logic)
+            # This logic only activates if STAGE 1 (proactive pattern matching) didn't trigger a switch
+            # Uses state-dependent hysteresis to prevent oscillation: once in a state, need stronger trigger to leave
+            # Entry thresholds: use_thr_low and use_thr_high (easy to enter)
+            # Exit thresholds: add/subtract HYST (harder to exit, prevents oscillation)
+            # BAL (middle state) has NO hysteresis - easy to enter AND exit
+            # Also considers longterm_avg to override short-term spikes
+            # and avoid getting stuck in wrong profile when short-term avg is misleading
+            target="BAL"
+            
+            # First check: use longterm_avg for strong signals (avoid being stuck in wrong profile)
+            if [ "$longterm_avg" -lt "$use_thr_low" ]; then
+                # Very low long-term average: go to SAV
+                # CRITICAL: Also require avg < use_thr_high to prevent switching to SAV when current load is high
+                # (e.g., longterm_avg=10 but current avg=80 due to spike → stay in BAL/PRF)
+                if [ "$avg" -lt "$use_thr_high" ]; then
+                    target="SAV"
+                fi
+            elif [ "$longterm_avg" -gt "$use_thr_high" ]; then
+                # Very high long-term average: at least PRF-ready
+                # CRITICAL: Also require avg > use_thr_low to prevent switching to PRF on sudden load drops
+                # (e.g., longterm_avg=80 but current avg=6 → don't switch to PRF yet)
+                if [ "$last_state" != "PRF" ] && [ "$avg" -gt "$use_thr_low" ]; then
+                    target="PRF"
+                fi
+            else
+                # longterm_avg is in normal range, use short-term avg with hysteresis
+                if [ "$last_state" = "SAV" ]; then
+                    # In SAV: stay until crossing low_threshold + HYST (prevents bouncing back)
+                    if [ "$avg" -lt $((use_thr_low + HYST)) ]; then
+                        target="SAV"
+                    fi
+                elif [ "$last_state" = "PRF" ]; then
+                    # In PRF: stay until crossing high_threshold - HYST (prevents bouncing back)
+                    if [ "$avg" -gt $((use_thr_high - HYST)) ]; then
+                        target="PRF"
+                    fi
+                else
+                    # In BAL: switch to SAV or PRF on threshold crossing (no hysteresis)
+                    if [ "$avg" -lt "$use_thr_low" ]; then
+                        target="SAV"
+                    elif [ "$avg" -gt "$use_thr_high" ]; then
+                        target="PRF"
+                    fi
+                fi
             fi
         fi
 
@@ -579,26 +2798,20 @@ run_loop() {
             fi
         fi
 
-        # Enforce minimum battery profile: respect user's TLP_PROFILE_BAT setting
-        # User can set TLP_PROFILE_BAT=balanced to prevent daemon from lowering profile below BAL
+        # Enforce minimum battery profile: only enforce PRF, never block SAV
+        # SAV at low load is always correct for efficiency - don't override it
+        # Only enforce min_profile if it's PRF (user demands performance)
         min_profile=$(get_min_battery_profile)
-        if [ -n "$min_profile" ] && [ "$min_profile" != "SAV" ]; then
-            # Only enforce if minimum is set and higher than SAV
-            case "$target:$min_profile" in
-                SAV:BAL|SAV:PRF)
-                    # Target SAV but user requires at least BAL
-                    target="$min_profile"
-                    ;;
-                BAL:PRF)
-                    # Target BAL but user requires at least PRF
-                    target="$min_profile"
-                    ;;
-            esac
+        if [ "$min_profile" = "PRF" ]; then
+            # User demands performance profile on battery
+            if [ "$target" != "PRF" ]; then
+                target="PRF"
+            fi
         fi
 
         # Check if profile change should occur with delta-based switching
         # Calculate absolute delta from last profile score
-        if [ $last_profile_score -eq 0 ]; then
+        if [ "$last_profile_score" -eq 0 ]; then
             # First time: allow any change
             delta=$SAV_DYNAMIC_SWITCH_DELTA
         else
@@ -611,12 +2824,68 @@ run_loop() {
             fi
         fi
 
-        if [ "$target" != "$last_state" ] && [ $((now - last_change)) -ge $MIND ] && [ $delta -ge $SAV_DYNAMIC_SWITCH_DELTA ]; then
-            apply_profile "$target"
-            last_state="$target"
-            last_change=$now
-            last_profile_score=$avg
-            echo_debug "power-saver" "state=$target avg=$avg delta=$delta applied profile: $target"
+        if [ "$target" != "$last_state" ] && [ $((now - last_change)) -ge "$MIND" ] && [ "$delta" -ge "$SAV_DYNAMIC_SWITCH_DELTA" ]; then
+            # Additional safety check: if avg and longterm_avg diverge too much, this is likely a spike
+            # Only apply strict spike detection for extreme profile jumps (SAV↔PRF)
+            # Allow BAL switch freely since it's the middle state and natural step
+            local skip_due_to_spike=false
+            
+            if ([ "$target" = "SAV" ] && [ "$last_state" = "PRF" ]) || ([ "$target" = "PRF" ] && [ "$last_state" = "SAV" ]); then
+                # This is an extreme jump (SAV↔PRF), apply strict spike detection
+                local avg_drift=$((avg - longterm_avg))
+                if [ $avg_drift -lt 0 ]; then
+                    avg_drift=$((-avg_drift))
+                fi
+                
+                if [ $avg_drift -ge 8 ]; then
+                    # Diverge too much → likely a spike, ignore it
+                    skip_due_to_spike=true
+                fi
+            fi
+            
+            if [ "$skip_due_to_spike" = false ]; then                
+                # Track time spent in previous profile before switching
+                if [ -n "$profile_start_time" ] && [ "$profile_start_time" -gt 0 ] && [ "$target" != "$last_state" ]; then
+                    local time_in_profile=$((now - profile_start_time))
+                    case "$last_state" in
+                        SAV) time_seconds_in_sav=$((time_seconds_in_sav + time_in_profile)) ;;
+                        BAL) time_seconds_in_bal=$((time_seconds_in_bal + time_in_profile)) ;;
+                        PRF) time_seconds_in_prf=$((time_seconds_in_prf + time_in_profile)) ;;
+                    esac
+                    profile_start_time=$now
+                fi
+                
+                apply_profile "$target" "$longterm_avg" "THRESHOLD"
+                last_state="$target"
+                last_change=$now
+                last_profile_score=$avg
+                
+                # Profile switch detected!
+                # Build switch sequence from switch_buf and process it
+                if [ -n "$switch_buf" ]; then
+                    check_and_manage_candidates "$target" "$switch_buf"
+                fi
+                
+                # Reset switch buffer for new profile
+                switch_buf=""
+                
+                # Persist state immediately after threshold switch
+                # Ensures consistency with proactive switch behavior and prevents data loss on daemon crash
+                save_psd_state
+            fi
+        
+        elif [ "$target" = "$last_state" ] && [ "$target" = "SAV" ]; then
+            # Even if profile stays the same (SAV), rescale cores if workload significantly changes
+            # This allows continuous core scaling within SAV profile based on actual load
+            workload_delta=$((longterm_avg - last_profile_score))
+            if [ $workload_delta -lt 0 ]; then
+                workload_delta=$((-workload_delta))
+            fi
+            if [ $workload_delta -ge 3 ]; then
+                # Update tracking only for profile changes, NOT for rescaling
+                # This allows rescaling to happen continuously as long as workload trends change
+                scale_cpu_cores "$longterm_avg" "SAV"
+            fi
         fi
 
         # Log only when battery capping state changes from false to true (entering capped state)
@@ -629,7 +2898,7 @@ run_loop() {
     done
 }
 
-# Main program
+# Main
 
 script_name="$(basename "$0")"
 if [ "$script_name" = "tlp-psd" ]; then
@@ -638,29 +2907,48 @@ if [ "$script_name" = "tlp-psd" ]; then
             RUNDIR=/run/tlp
             # Start via systemd unit - leverages Restart=on-failure mechanism
             systemctl start tlp-psd 2>/dev/null
+            exit $?
             ;;
         stop)
             RUNDIR=/run/tlp
             pid=$(cat "$RUNDIR/tlp-psd.pid" 2>/dev/null)
             if [ -n "$pid" ]; then
                 # Try graceful termination first (SIGTERM)
+                # This will trigger cleanup_daemon through EXIT trap
                 kill -TERM "$pid" 2>/dev/null
                 # Wait for process to exit
                 sleep 1
-                # Force kill if still running
-                if kill -0 "$pid" 2>/dev/null; then
-                    kill -9 "$pid" 2>/dev/null || true
-                fi
+                # Force kill immediately if still running
+                # shellcheck disable=SC2015
+                kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
             fi
+            #Fallback cleanup in case process is already dead but PID file exists
             remove_pidfile
             ;;
         run)
+            trap 'cleanup_daemon' EXIT TERM INT
             RUNDIR=/run/tlp
+            set_idle_governor
+            optimize_vm_parameters
+            scale_cpu_cores 0 "SAV"
+            start_scx_p2dq
             run_loop
             ;;
+        status)
+            # Display daemon statistics (no root required)
+            RUNDIR=/run/tlp
+            pid=$(cat "$RUNDIR/tlp-psd.pid" 2>/dev/null)
+            if [ -n "$pid" ]; then
+                display_status
+            else
+                echo "tlp-psd is not running"
+                exit 1                
+            fi
+            ;;
         *)
-            echo "Usage: $0 {start|stop|run}"
+            echo "Usage: $0 {start|stop|run|status}"
             exit 2
             ;;
     esac
 fi
+

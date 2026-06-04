@@ -1,0 +1,16 @@
+# tlp-psd - Power Saver Daemon with workload-dependent profile switching
+#
+# Copyright (c) 2026 Mario Herrmann <marioherrmann at posteo.de> and others.
+# This software is licensed under the GPL v2 or later.
+
+description "TLP Power Saver Daemon"
+
+start on ( started tlp and virtual-filesystems and runlevel [2345] )
+stop on runlevel [!2345]
+
+respawn
+respawn limit 5 60
+
+env PSD=@SBIN@/tlp-psd
+
+exec $PSD run

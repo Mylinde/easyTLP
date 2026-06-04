@@ -11,8 +11,8 @@ PartOf=tlp.service
 
 [Service]
 Type=simple
-ExecStart=@TLP_TLIB@/tlp-psd run
-ExecStop=/bin/sh -c 'kill $(cat /run/tlp/tlp-psd.pid 2>/dev/null) 2>/dev/null || true'
+ExecStart=/usr/bin/tlp-psd run
+ExecStop=/usr/bin/tlp-psd stop
 Restart=on-failure
 RestartSec=5
 KillMode=mixed
@@ -20,10 +20,13 @@ KillMode=mixed
 StandardOutput=journal
 StandardError=journal
 
-# Lockdown - allow kernel/system access for PM QoS and workload metrics
 NoNewPrivileges=yes
 ProtectHome=yes
-ReadWritePaths=/run/tlp /tmp /proc /sys
+ReadWritePaths=/run/tlp /tmp /proc /sys /sys/fs/cgroup
 ProtectClock=yes
 ProtectHostname=yes
-RestrictRealtime=yes
+RestrictRealtime=no
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+Nice=-10
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN

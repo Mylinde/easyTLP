@@ -255,35 +255,59 @@
 #PLATFORM_PROFILE_ON_SAV="low-power cool quiet"
 
 # Profile Saver - Workload-dependent switching between SAV, BAT and PRF profiles
-# When enabled, TLP automatically switches between the three profiles based on
-# workload lag detection. This daemon is particularly useful for users who want
-# maximum automation.
+# When enabled, TLP automatically switches between power profiles based on
+# system workload. This daemon is particularly useful for users who want
+# maximum automation without manual tuning.
 # Default: 1
 #POWER_SAVER_ENABLE=1
 # 
-# The daemon monitors CPU utilization and I/O-wait to adapt power profiles:
-#   - Idle (low load):      → power-saver profile (maximum power saving)
-#   - Normal work (med):    → balanced profile (responsive)
-#   - Heavy load (high):    → performance profile (maximum performance)
+# How it works:
+#   The daemon monitors CPU utilization and I/O-wait (lag score) and switches
+#   between profiles to match workload intensity:
+#   - Idle/low load:   SAV (power-saver)  - maximum power saving
+#   - Normal work:     BAL (balanced)     - responsive and efficient
+#   - Heavy load:      PRF (performance)  - maximum responsiveness
 #
-# Adaptive Threshold System:
-#   Uses a 1-minute rolling average of workload metrics to automatically calculate
-#   thresholds. This means the daemon adapts to your typical system load pattern
-#   without requiring any configuration.
+#   Intelligent switching prevents profile oscillation while maintaining fast
+#   response to real workload changes. The learning system adapts to your typical
+#   usage patterns over time.
 #
-# Delta-Based Switching:
-#   Only switches profiles when lag score changes by ≥5 points from last switch.
-#   This prevents oscillation while maintaining responsiveness to real load changes.
+# Tuning tips (optional - safe to leave unconfigured):
+#   For slower switching (more stable): increase INTERVAL or SAMPLES
+#   For faster switching (more responsive): decrease INTERVAL or increase SWITCH_DELTA
+#   To disable learning system: set SAV_DYNAMIC_ADAPTIVE=0 (uses fixed thresholds)
 #
-# Profile Saver settings (all optional, shown with defaults):
-#SAV_DYNAMIC_INTERVAL=4                        # sampling interval [seconds]
-#SAV_DYNAMIC_SAMPLES=3                         # moving average window size [samples]
-#SAV_DYNAMIC_HYSTERESIS=5                      # points required to exit state [lag_score]
-#SAV_DYNAMIC_MIN_DELAY=2                       # minimum delay between switches [seconds]
-#SAV_DYNAMIC_ADAPTIVE=1                        # use adaptive thresholds (0=static 25,75)
-#SAV_DYNAMIC_LONGTERM_PERIOD=60                # time window for average [seconds]
-#SAV_DYNAMIC_THRESHOLD_OFFSET=15               # threshold range: avg±offset [lag_score]
-#SAV_DYNAMIC_SWITCH_DELTA=5                    # minimum change to trigger switch [lag_score]
+# Profile Saver fine-tuning settings (all optional, shown with defaults):
+#
+#SAV_DYNAMIC_INTERVAL=2
+#   How frequently the daemon samples workload (in seconds).
+#   Lower = faster response but more CPU usage. 
+#   Range: 1-5 seconds. Default: 2 (recommended).
+#
+#SAV_DYNAMIC_SAMPLES=3
+#   Number of samples used for smoothing (moving average).
+#   Reduces noise and prevents rapid switching on load spikes.
+#   Range: 2-5. Default: 3 (recommended).
+#
+#SAV_DYNAMIC_HYSTERESIS=5
+#   Lag points needed to exit current profile (prevents oscillation).
+#   Higher = more stable but slower reaction to big changes.
+#   Range: 3-10. Default: 5 (recommended).
+#
+#SAV_DYNAMIC_MIN_DELAY=3
+#   Minimum seconds between profile switches.
+#   Prevents rapid back-and-forth switching.
+#   Should be ≥ than SAV_DYNAMIC_INTERVAL for stable behavior.
+#
+#SAV_DYNAMIC_ADAPTIVE=1
+#   Adaptive (1) or static (0) threshold calculation.
+#   Adaptive: thresholds auto-adjust based on your workload patterns (recommended).
+#   Static: fixed low threshold (≤25) for SAV, high (≥75) for PRF.
+#
+#SAV_DYNAMIC_SWITCH_DELTA=5
+#   Minimum lag score change to trigger profile switch.
+#   Prevents unnecessary switching on minor fluctuations.
+#   Range: 3-8. Default: 5 (recommended).
 
 # System suspend mode:
 #   s2idle: Idle standby - a pure software, light-weight, system sleep state,

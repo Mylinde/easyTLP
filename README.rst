@@ -1,22 +1,30 @@
-easyTLP - TLP with Power Saver Daemon
-=====================================
+easyTLP - Intelligent TLP with Adaptive Power Saver Daemon
+===========================================================
 
-**Power Saver Daemon** *(Difference to upstream TLP)*
--------------
-This fork includes the **tlp-psd** daemon, which automatically switches between power profiles depending on system load.
-It monitors CPU utilization and I/O latency and dynamically switches between the
-SAV (power-saving mode), BAL (balanced), and PRF (performance) profiles as long as the device is
-running on battery power. This enables automatic optimization without manual
-intervention—battery life is maximized during idle periods, while
-responsiveness is maintained when needed. The daemon is enabled by default.
+**Intelligent Power Saver Daemon** *(tlp-psd)*
+----------------------------------------------
 
-Since **tlp-psd** operates completely autonomously, the **tlp-pd** daemon
-and **tlpctl** have been removed as manual profile switching is no longer
-necessary.
+This fork includes **tlp-psd**, an advanced self-learning daemon that automatically switches between power profiles based on system workload and behavioral patterns.
 
-For detailed information about the Power Saver Daemon, see `README-POWER-SAVER.md <README-POWER-SAVER.md>`_.
+The daemon:
+  • Monitors CPU and I/O activity in real-time
+  • **Learns your workload patterns** and personalizes switching thresholds
+  • Makes **trend-based predictions** about future load
+  • **Adapts its learning frequency** based on prediction accuracy
+  • **Survives reboots** with persistent state management
+  • Switches dynamically between SAV, BAL, and PRF profiles
+  • Runs on battery power only (auto-stops on AC)
+  • **Integrates scx_p2dq scheduler 1.1.1** for adaptive kernel-level workload balancing
 
-**tlp-psd** is not part of the upstream TLP project and is only available in this fork. Bug reports and contributions related to **tlp-psd** should be directed to this repository.
+Unlike simple heuristic approaches, **tlp-psd implements a self-correcting predictive system** that continuously improves its accuracy. The daemon is **zero-configuration** — it automatically optimizes for your specific system and usage patterns.
+
+Key improvement: **Zero manual configuration needed**. The daemon understands your workload better than any static configuration ever could.
+
+For detailed information, see `README-POWER-SAVER.md <README-POWER-SAVER.md>`_.
+
+**Status**: Production-ready. Tested with various workloads (office, development, heavy computation).
+
+**Note**: tlp-psd is not part of the upstream TLP project and is only available in this fork. Bug reports and contributions related to **tlp-psd** should be directed to this repository.
 
 TLP - Optimize Linux Laptop Battery Life
 ========================================

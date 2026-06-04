@@ -1,0 +1,5 @@
+{
+    "vscode-mermaid-extension.useSinglePreview": true,
+    "editor.defaultFormatter": null,
+    "telemetry.feedback.enabled": false
+}
