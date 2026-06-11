@@ -997,9 +997,9 @@ get_ac_power() {
 
 # Apply thermal policy with fallback verification
 apply_thermal_policy() {
-    local profile=$1
+    local profile="$1"
     local target_policy=""
-    local fallback_policy="step_wise"
+    local fallback_policy="fair_share"
 
     case "$profile" in
         "PRF") target_policy="power_allocator" ;;
