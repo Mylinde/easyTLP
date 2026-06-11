@@ -995,33 +995,6 @@ get_ac_power() {
     echo 1
 }
 
-# Apply thermal policy with fallback verification
-apply_thermal_policy() {
-    local profile="$1"
-    local target_policy=""
-    local fallback_policy="fair_share"
-
-    case "$profile" in
-        "PRF") target_policy="power_allocator" ;;
-        "BAL") target_policy="fair_share" ;;
-        "SAV") target_policy="step_wise" ;;
-        *)     target_policy="step_wise" ;;
-    esac
-
-    for zone in /sys/class/thermal/thermal_zone*; do
-        if [ -w "$zone/policy" ]; then
-            # Attempt to set the desired policy
-            echo "$target_policy" > "$zone/policy" 2>/dev/null
-            
-            # Verify if the policy was actually accepted
-            if [ "$(cat "$zone/policy")" != "$target_policy" ]; then
-                echo_debug "power-saver" "Policy $target_policy not accepted, falling back to $fallback_policy"
-                echo "$fallback_policy" > "$zone/policy" 2>/dev/null
-            fi
-        fi
-    done
-}
-
 apply_profile() {
     local profile="$1"
     local workload="${2:-0}"
@@ -1052,14 +1025,20 @@ apply_profile() {
         SAV)
             tlp_profile="power-saver"
             pm_qos_constraint=100000  # 100ms: allow aggressive power saving
+            systemctl set-property user.slice CPUWeight=600
+            systemctl set-property system.slice CPUWeight=400
             ;;
         BAL)
             tlp_profile="balanced"
             pm_qos_constraint=10000   # 10ms: moderate restrictions
+            systemctl set-property user.slice CPUWeight=500
+            systemctl set-property system.slice CPUWeight=500
             ;;
         PRF)
             tlp_profile="performance"
-            pm_qos_constraint=100     # 100µs: strict latency, no deep idle   
+            pm_qos_constraint=100     # 100µs: strict latency, no deep idle
+            systemctl set-property user.slice CPUWeight=800
+            systemctl set-property system.slice CPUWeight=200   
             ;;
         *)
             tlp_profile="$profile"
@@ -2666,7 +2645,6 @@ run_loop() {
                                 # predicted_profile still contains the target (BAL/PRF)
                                 # With all cores active, apply_profile will decide whether to actually switch or stay in SAV based on current workload
                                 apply_profile "$predicted_profile" "$avg" "PROACTIVE"
-                                apply_thermal_policy "$predicted_profile"
                                 
                                 # Record the pattern match (for validation)
                                 check_and_manage_candidates "$predicted_profile" "$switch_buf"
@@ -2883,7 +2861,6 @@ run_loop() {
                 fi
                 
                 apply_profile "$target" "$longterm_avg" "THRESHOLD"
-                apply_thermal_policy "$target"
                 last_state="$target"
                 last_change=$now
                 last_profile_score=$avg
