@@ -801,10 +801,11 @@ write_cpuset_mask() {
     # Returns 0 if at least one succeeds, 1 if all fail
     local cpu_mask="$1"
     local success=0
-    
-    # system.slice (where systemd services run)
+
     # Enable controller immediately before write to avoid race conditions
     enable_cpuset_controller
+    
+    # system.slice (where systemd services run)
     if [ -f "/sys/fs/cgroup/system.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/system.slice/cpuset.cpus" ]; then
         if echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null; then
             success=1
@@ -812,8 +813,6 @@ write_cpuset_mask() {
     fi
     
     # user.slice (where user processes run)
-    # Write independently of system.slice result to ensure both are constrained
-    enable_cpuset_controller
     if [ -f "/sys/fs/cgroup/user.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/user.slice/cpuset.cpus" ]; then
         if echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null; then
             success=1
@@ -886,11 +885,11 @@ scale_cpu_cores_sav() {
     
     # Calculate target based on workload
     local target_cores
-    if [ "$workload" -lt 5 ]; then
+    if [ "$workload" -lt 4 ]; then
         target_cores=$((total_cores / 4))  # 25%
-    elif [ "$workload" -lt 10 ]; then
+    elif [ "$workload" -lt 8 ]; then
         target_cores=$((total_cores / 2))  # 50%
-    elif [ "$workload" -lt 15 ]; then
+    elif [ "$workload" -lt 12 ]; then
         target_cores=$((total_cores * 3 / 4))  # 75%
     else
         target_cores=$total_cores  # 100%
@@ -994,6 +993,33 @@ get_ac_power() {
     
     # Fallback: assume AC power if we can't determine
     echo 1
+}
+
+# Apply thermal policy with fallback verification
+apply_thermal_policy() {
+    local profile=$1
+    local target_policy=""
+    local fallback_policy="step_wise"
+
+    case "$profile" in
+        "PRF") target_policy="power_allocator" ;;
+        "BAL") target_policy="fair_share" ;;
+        "SAV") target_policy="step_wise" ;;
+        *)     target_policy="step_wise" ;;
+    esac
+
+    for zone in /sys/class/thermal/thermal_zone*; do
+        if [ -w "$zone/policy" ]; then
+            # Attempt to set the desired policy
+            echo "$target_policy" > "$zone/policy" 2>/dev/null
+            
+            # Verify if the policy was actually accepted
+            if [ "$(cat "$zone/policy")" != "$target_policy" ]; then
+                echo_debug "power-saver" "Policy $target_policy not accepted, falling back to $fallback_policy"
+                echo "$fallback_policy" > "$zone/policy" 2>/dev/null
+            fi
+        fi
+    done
 }
 
 apply_profile() {
@@ -2640,6 +2666,7 @@ run_loop() {
                                 # predicted_profile still contains the target (BAL/PRF)
                                 # With all cores active, apply_profile will decide whether to actually switch or stay in SAV based on current workload
                                 apply_profile "$predicted_profile" "$avg" "PROACTIVE"
+                                apply_thermal_policy "$predicted_profile"
                                 
                                 # Record the pattern match (for validation)
                                 check_and_manage_candidates "$predicted_profile" "$switch_buf"
@@ -2856,6 +2883,7 @@ run_loop() {
                 fi
                 
                 apply_profile "$target" "$longterm_avg" "THRESHOLD"
+                apply_thermal_policy "$target"
                 last_state="$target"
                 last_change=$now
                 last_profile_score=$avg
@@ -2930,7 +2958,6 @@ if [ "$script_name" = "tlp-psd" ]; then
             RUNDIR=/run/tlp
             set_idle_governor
             optimize_vm_parameters
-            scale_cpu_cores 0 "SAV"
             start_scx_p2dq
             run_loop
             ;;
