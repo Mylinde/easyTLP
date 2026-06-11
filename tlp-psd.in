@@ -802,9 +802,8 @@ write_cpuset_mask() {
     local cpu_mask="$1"
     local success=0
 
-    # Enable controller immediately before write to avoid race conditions
     enable_cpuset_controller
-    
+
     # system.slice (where systemd services run)
     if [ -f "/sys/fs/cgroup/system.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/system.slice/cpuset.cpus" ]; then
         if echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null; then
@@ -2158,16 +2157,10 @@ cleanup_daemon() {
     # Force activation of all offline cores
     if [ "$total_cores" -gt 0 ]; then
         echo_debug "power-saver" "Daemon shutdown: reactivating all CPU cores..."
-        for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
-            if [ -f "$cpu_online" ] && [ -w "$cpu_online" ]; then
-                echo 1 > "$cpu_online" 2>/dev/null && activated=$((activated + 1))
-            fi
-        done
-        echo_debug "power-saver" "Daemon shutdown: reactivated all $((total_cores + 1)) CPU cores"
-        
-        # Also reactivate all cores via Cgroups cpuset.cpus
+        # Reactivate all cores via Cgroups cpuset.cpus
         local all_cores_mask="$total_cores"
         write_cpuset_mask "0-$all_cores_mask"
+        echo_debug "power-saver" "Daemon shutdown: reactivated all $((total_cores + 1)) CPU cores"
     fi
     
     # Stop scx-p2dq
@@ -2935,6 +2928,7 @@ if [ "$script_name" = "tlp-psd" ]; then
             RUNDIR=/run/tlp
             set_idle_governor
             optimize_vm_parameters
+            enable_cpuset_controller
             start_scx_p2dq
             run_loop
             ;;
