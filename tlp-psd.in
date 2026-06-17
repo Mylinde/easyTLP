@@ -764,12 +764,7 @@ enable_favordynmods() {
     # Enable favordynmods for faster cgroup modifications (cpuset.cpus updates)
     # Trade-off: slightly slower fork/exit, but faster task migration and controller changes
     # Beneficial for workload-dependent CPU scaling where cpuset.cpus changes frequently      
-    mount -o remount,defaults,favordynmods /sys/fs/cgroup
-}
-
-disable_favordynmods() {
-    # Restore default cgroup behavior
-    mount -o remount,defaults /sys/fs/cgroup
+    mount -o remount,favordynmods /sys/fs/cgroup
 }
 
 enable_cpuset_controller() {
@@ -780,7 +775,7 @@ enable_cpuset_controller() {
     local cgroup_path
     local cgroup_dir
     
-    # Try to enable in root cgroup first
+    # Try to enable in root cgroup first (if supported)
     if [ -w "/sys/fs/cgroup/cgroup.subtree_control" ]; then
         echo "+cpuset" > "/sys/fs/cgroup/cgroup.subtree_control" 2>/dev/null
     fi
@@ -795,30 +790,35 @@ enable_cpuset_controller() {
     fi
 }
 
+LAST_CPU_MASK=""
+
 write_cpuset_mask() {
-    # Write CPU mask to cpuset.cpus with proper error handling
-    # Writes to both system.slice AND user.slice for consistent constraints
+    # Write CPU mask to cpuset.cpus for both system.slice and user.slice
+    # Writes to both system.slice and user.slice for consistent constraints
     # Returns 0 if at least one succeeds, 1 if all fail
     local cpu_mask="$1"
     local success=0
 
-    enable_cpuset_controller
+    # Check if the desired mask is already set to avoid unnecessary writes (and potential overhead)
+    if [ "$(echo "$cpu_mask" | tr -d ',-')" = "$(echo "$LAST_CPU_MASK" | tr -d ',-')" ]; then
+        return 0
+    else
+        # system.slice (where system services run)
+        if [ -w "/sys/fs/cgroup/system.slice/cpuset.cpus" ]; then
+            echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null
+            success=1
+        fi 
 
-    # system.slice (where systemd services run)
-    if [ -f "/sys/fs/cgroup/system.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/system.slice/cpuset.cpus" ]; then
-        if echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null; then
+        # user.slice (where user processes run)
+        if [ -w "/sys/fs/cgroup/user.slice/cpuset.cpus" ]; then
+            echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null
             success=1
         fi
-    fi
-    
-    # user.slice (where user processes run)
-    if [ -f "/sys/fs/cgroup/user.slice/cpuset.cpus" ] && [ -w "/sys/fs/cgroup/user.slice/cpuset.cpus" ]; then
-        if echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null; then
-            success=1
-        fi
-    fi
 
-    [ "$success" -eq 1 ] && return 0 || return 1
+        if [ "$success" -eq 1 ]; then
+	        LAST_CPU_MASK="$cpu_mask"
+	    fi
+    fi
 }
 
 scale_cpu_cores_sav() {
@@ -942,7 +942,7 @@ scale_cpu_cores() {
     local total_cores=0
     
     # Count total cores
-    for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
+    for cpu_online in "$cpu_online_dir"/cpu[0-9]*/online; do
         if [ -f "$cpu_online" ]; then
             total_cores=$((total_cores + 1))
         fi
@@ -956,10 +956,8 @@ scale_cpu_cores() {
         # Activate all cores via Cgroups (consistent with SAV)
         local cpu_mask="0-$total_cores"
         write_cpuset_mask "$cpu_mask"
-        disable_favordynmods  # Disable after write to avoid fork/exit overhead
     else
         # SAV: progressive core scaling via Cgroups
-        enable_favordynmods
         scale_cpu_cores_sav "$workload"
     fi
 }
@@ -1024,19 +1022,19 @@ apply_profile() {
         SAV)
             tlp_profile="power-saver"
             pm_qos_constraint=100000  # 100ms: allow aggressive power saving
-            systemctl set-property user.slice CPUWeight=600
+            systemctl set-property user.slice CPUWeight=600 # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
             systemctl set-property system.slice CPUWeight=400
             ;;
         BAL)
             tlp_profile="balanced"
             pm_qos_constraint=10000   # 10ms: moderate restrictions
-            systemctl set-property user.slice CPUWeight=500
+            systemctl set-property user.slice CPUWeight=500 # Equal weight for user and system processes in BAL for a balanced approach
             systemctl set-property system.slice CPUWeight=500
             ;;
         PRF)
             tlp_profile="performance"
             pm_qos_constraint=100     # 100µs: strict latency, no deep idle
-            systemctl set-property user.slice CPUWeight=800
+            systemctl set-property user.slice CPUWeight=800 # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
             systemctl set-property system.slice CPUWeight=200   
             ;;
         *)
@@ -2131,10 +2129,6 @@ cleanup_daemon() {
         optimal_low=5
     fi
     
-    local cpu_online_dir="/sys/devices/system/cpu"
-    local total_cores=0
-    local activated=0
-    
     # Only save state if we actually learned something (have enough history)
     # This prevents overwriting existing learned state if daemon crashes at startup
     local history_count
@@ -2147,22 +2141,27 @@ cleanup_daemon() {
         echo_debug "power-saver" "Daemon stopped before learning (${history_count} samples) - preserving existing state"
     fi
     
-    # Count total CPU cores
-    for cpu_online in "$cpu_online_dir"/cpu[1-9]*/online; do
+    # Scale back to full performance before exit (0 = all cores)
+    local cpu_online_dir="/sys/devices/system/cpu"
+    local total_cores=0
+    
+    # Count total cores
+    for cpu_online in "$cpu_online_dir"/cpu[0-9]*/online; do
         if [ -f "$cpu_online" ]; then
             total_cores=$((total_cores + 1))
         fi
     done
     
-    # Force activation of all offline cores
-    if [ "$total_cores" -gt 0 ]; then
-        echo_debug "power-saver" "Daemon shutdown: reactivating all CPU cores..."
-        # Reactivate all cores via Cgroups cpuset.cpus
-        local all_cores_mask="$total_cores"
-        write_cpuset_mask "0-$all_cores_mask"
-        echo_debug "power-saver" "Daemon shutdown: reactivated all $((total_cores + 1)) CPU cores"
+    local cpu_mask
+    cpu_mask="0-$total_cores"
+    if [ "$total_cores" -lt 1 ]; then
+        return 0
+    else
+        enable_cpuset_controller
+        echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null
+        echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null
     fi
-    
+
     # Stop scx-p2dq
     stop_scx_p2dq
     
@@ -2411,12 +2410,14 @@ run_loop() {
             last_ac_check=$now
             cached_ac_status=$(get_ac_power)
         fi
-        
+             
+        # Stop daemon on AC power
         if [ "$cached_ac_status" = "1" ]; then
-            echo_debug "power-saver" "switched to AC mode, stopping"
+            echo_debug "power-saver" "switched to AC mode, activating all CPU cores, stopping daemon"
+            scale_cpu_cores 0 "PRF"
             exit 0
         fi
-        
+                
         # Health check: verify scx_p2dq is still running (every 2*INTERVAL)
         if [ $((now - last_scx_health_check)) -ge $((INTERVAL * 2)) ]; then
             last_scx_health_check=$now
@@ -2475,14 +2476,6 @@ run_loop() {
             # Save state after learning cycle (PREDICTION_HITS already saved above)
             # This ensures all state variables are persisted
             save_psd_state
-        fi
-                
-        # Stop daemon on AC power
-        if [ "$cached_ac_status" = "1" ]; then
-            echo_debug "power-saver" "switched to AC mode, activating all CPU cores"
-            scale_cpu_cores 0 "PRF"
-            echo_debug "power-saver" "stopping daemon"
-            exit 0
         fi
 
         # sample lag indicator and maintain moving average
@@ -2928,6 +2921,7 @@ if [ "$script_name" = "tlp-psd" ]; then
             RUNDIR=/run/tlp
             set_idle_governor
             optimize_vm_parameters
+            enable_favordynmods
             enable_cpuset_controller
             start_scx_p2dq
             run_loop
