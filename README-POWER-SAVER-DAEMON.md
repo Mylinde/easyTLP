@@ -6,9 +6,11 @@ A lightweight, intelligent, self-learning daemon that automatically switches bet
 
 **tlp-psd** continuously monitors system load and intelligently switches between three power profiles:
 
-- **SAV** (power-saver): Aggressive power saving for idle/light workloads  
+- **SAV** (power-saver): Aggressive power saving for idle/light workloads
+  - CPU core scaling via cgroups v2 on systems with systemd
 - **BAL** (balanced): Balanced mode for typical work  
-- **PRF** (performance): Maximum performance for heavy computational tasks  
+- **PRF** (performance): Maximum performance for heavy computational tasks
+
 
 ### Key Capabilities
 
@@ -152,28 +154,28 @@ Check daemon status with `tlp-psd status`:
 === TLP Power Saver Daemon Status ===
 
 Daemon Runtime:
-  14 hours 22 minutes 42 seconds
+  2 days 4 hours 31 minutes 18 seconds
 
 Estimated fullcharge Battery Life:
-  5 hours 42 minutes 36 seconds
+  5 hours 56 minutes 24 seconds
 
 Intelligence:
-  Confidence Level: 70/100 (11 min learning cycle)
+  Confidence Level: 100/100 (14 min learning cycle)
 
 Predictions:
-  Accuracy: 122/146 (83%)
+  Accuracy: 458/538 (85%)
 
 Learned Patterns:
-  Total: 23 (SAV: 7, BAL: 14, PRF: 2)
+  Total: 33 (SAV: 12, BAL: 18, PRF: 3)
 
 Proactive Switches:
-  Executed: 79
+  Executed: 265
 
 Profile Distribution:
-  SAV: 91% | BAL: 7% | PRF: 2%
+  SAV: 90% | BAL: 8% | PRF: 2%
 
 Energy Consumption:
-  SAV: 83.31 Wh | BAL: 5.60 Wh | PRF: 1.23 Wh | Total: 90.14 Wh | Average: 6.27 Wh/h
+  SAV: 310.95 Wh | BAL: 21.70 Wh | PRF: 4.78 Wh | Total: 337.43 Wh | Average: 6.42 Wh/h
 
 Current Profile:
   SAV
