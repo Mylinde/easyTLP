@@ -2,7 +2,7 @@
 # tlp-psd - Workload-dependent profile switching (SAV/BAL/PRF)
 # Automatically switches between SAV, BAL, and PRF profiles based on workload.
 #
-# +++ 1.10.5 --- 04.06.2026 +++
+# +++ 1.10.5 --- 20.06.2026 +++
 #
 # Copyright (c) 2026 Mario Herrmann <marioherrmann at posteo.de>.
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -666,7 +666,7 @@ set_idle_governor() {
     # Check if cpuidle sysfs interface exists
     if [ ! -d "$cpuidle_dir" ]; then
         echo_debug "power-saver" "Idle governor: cpuidle sysfs not available"
-        #return 0
+        return 0
     fi
 
     # Read current governor
@@ -760,14 +760,16 @@ optimize_vm_parameters() {
     fi
 }
 
-enable_favordynmods() {
+enable_favordynmods() {        
+    [ -x /usr/bin/systemctl ] || return 0
     # Enable favordynmods for faster cgroup modifications (cpuset.cpus updates)
     # Trade-off: slightly slower fork/exit, but faster task migration and controller changes
-    # Beneficial for workload-dependent CPU scaling where cpuset.cpus changes frequently      
+    # Beneficial for workload-dependent CPU scaling where cpuset.cpus changes frequently     
     mount -o remount,favordynmods /sys/fs/cgroup
 }
 
-enable_cpuset_controller() {
+enable_cpuset_controller() {        
+    [ -x /usr/bin/systemctl ] || return 0
     # Enable cpuset controller in cgroup hierarchy
     # In Cgroups v2, controllers must be explicitly enabled in subtree_control
     # This allows cpuset.cpus and other cpuset files to become available
@@ -798,6 +800,8 @@ write_cpuset_mask() {
     # Returns 0 if at least one succeeds, 1 if all fail
     local cpu_mask="$1"
     local success=0
+
+    enable_cpuset_controller  # Ensure cpuset controller is enabled before writing masks
 
     # Check if the desired mask is already set to avoid unnecessary writes (and potential overhead)
     if [ "$(echo "$cpu_mask" | tr -d ',-')" = "$(echo "$LAST_CPU_MASK" | tr -d ',-')" ]; then
@@ -933,14 +937,15 @@ scale_cpu_cores_sav() {
     write_cpuset_mask "$cpu_mask"
 }
 
-scale_cpu_cores() {
+scale_cpu_cores() {    
+    [ -x /usr/bin/systemctl ] || return 0
     # Dispatch to appropriate function based on profile
     # All profiles now use Cgroups for consistent core management with scx_p2dq
     local workload="${1:-0}"
     local profile="${2:-SAV}"
     local cpu_online_dir="/sys/devices/system/cpu"
     local total_cores=0
-    
+
     # Count total cores
     for cpu_online in "$cpu_online_dir"/cpu[0-9]*/online; do
         if [ -f "$cpu_online" ]; then
@@ -1022,20 +1027,26 @@ apply_profile() {
         SAV)
             tlp_profile="power-saver"
             pm_qos_constraint=100000  # 100ms: allow aggressive power saving
-            systemctl set-property user.slice CPUWeight=600 # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
-            systemctl set-property system.slice CPUWeight=400
+            if [ -x /usr/bin/systemctl ]; then
+                systemctl set-property user.slice CPUWeight=600 # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
+                systemctl set-property system.slice CPUWeight=400
+            fi
             ;;
         BAL)
             tlp_profile="balanced"
             pm_qos_constraint=10000   # 10ms: moderate restrictions
-            systemctl set-property user.slice CPUWeight=500 # Equal weight for user and system processes in BAL for a balanced approach
-            systemctl set-property system.slice CPUWeight=500
+            if [ -x /usr/bin/systemctl ]; then
+                systemctl set-property user.slice CPUWeight=500 # Equal weight for user and system processes in BAL for a balanced approach
+                systemctl set-property system.slice CPUWeight=500
+            fi
             ;;
         PRF)
             tlp_profile="performance"
             pm_qos_constraint=100     # 100µs: strict latency, no deep idle
-            systemctl set-property user.slice CPUWeight=800 # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
-            systemctl set-property system.slice CPUWeight=200   
+            if [ -x /usr/bin/systemctl ]; then
+                systemctl set-property user.slice CPUWeight=800 # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
+                systemctl set-property system.slice CPUWeight=200
+            fi
             ;;
         *)
             tlp_profile="$profile"
