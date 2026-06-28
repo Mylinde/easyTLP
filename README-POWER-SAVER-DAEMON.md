@@ -7,7 +7,7 @@ A lightweight, intelligent, self-learning daemon that automatically switches bet
 **tlp-psd** continuously monitors system load and intelligently switches between three power profiles:
 
 - **SAV** (power-saver): Aggressive power saving for idle/light workloads
-  - CPU core scaling via cgroups v2 on systems with systemd
+  - SMT-aware CPU core scaling via cgroups v2 on systems with systemd. Scaled will be the system.slice and the user.slice.
 - **BAL** (balanced): Balanced mode for typical work  
 - **PRF** (performance): Maximum performance for heavy computational tasks
 

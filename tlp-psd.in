@@ -768,7 +768,7 @@ enable_favordynmods() {
     mount -o remount,favordynmods /sys/fs/cgroup
 }
 
-enable_cpuset_controller() {        
+enable_cgroup_controller() {        
     [ -x /usr/bin/systemctl ] || return 0
     # Enable cpuset controller in cgroup hierarchy
     # In Cgroups v2, controllers must be explicitly enabled in subtree_control
@@ -801,7 +801,7 @@ write_cpuset_mask() {
     local cpu_mask="$1"
     local success=0
 
-    enable_cpuset_controller  # Ensure cpuset controller is enabled before writing masks
+    enable_cgroup_controller  # Ensure cgroup controller is enabled before writing masks
 
     # Check if the desired mask is already set to avoid unnecessary writes (and potential overhead)
     if [ "$(echo "$cpu_mask" | tr -d ',-')" = "$(echo "$LAST_CPU_MASK" | tr -d ',-')" ]; then
@@ -967,6 +967,22 @@ scale_cpu_cores() {
     fi
 }
 
+write_cpu_weight() {
+    # Set CPU weight for user.slice and system.slice via systemd
+    # Parameters: $1 = user_weight (0-1000), $2 = system_weight (0-1000)
+    local user_weight="${1:-100}"
+    local system_weight="${2:-100}"
+
+    enable_cgroup_controller  # Ensure cgroup controller is enabled before writing
+    
+    if [ -x /usr/bin/systemctl ]; then
+        echo "$user_weight" > /sys/fs/cgroup/user.slice/cpu.weight 2>/dev/null
+        echo "$system_weight" > /sys/fs/cgroup/system.slice/cpu.weight 2>/dev/null
+    else
+        return 0
+    fi
+}
+
 get_ac_power() {
     # Determine if running on AC power (1=on AC, 0=on battery)
     # Optimized: check first battery only (most systems have just one)    
@@ -1027,36 +1043,35 @@ apply_profile() {
         SAV)
             tlp_profile="power-saver"
             pm_qos_constraint=100000  # 100ms: allow aggressive power saving
-            if [ -x /usr/bin/systemctl ]; then
-                systemctl set-property user.slice CPUWeight=600 # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
-                systemctl set-property system.slice CPUWeight=400
-            fi
+            cpu_weight_user=600  # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
+            cpu_weight_system=400
             ;;
         BAL)
             tlp_profile="balanced"
             pm_qos_constraint=10000   # 10ms: moderate restrictions
-            if [ -x /usr/bin/systemctl ]; then
-                systemctl set-property user.slice CPUWeight=500 # Equal weight for user and system processes in BAL for a balanced approach
-                systemctl set-property system.slice CPUWeight=500
-            fi
+            cpu_weight_user=500  # Equal weight for user and system processes in BAL for a balanced approach
+            cpu_weight_system=500
             ;;
         PRF)
             tlp_profile="performance"
             pm_qos_constraint=100     # 100µs: strict latency, no deep idle
-            if [ -x /usr/bin/systemctl ]; then
-                systemctl set-property user.slice CPUWeight=800 # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
-                systemctl set-property system.slice CPUWeight=200
-            fi
+            cpu_weight_user=800  # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
+            cpu_weight_system=200
             ;;
         *)
             tlp_profile="$profile"
             pm_qos_constraint=""
+            cpu_weight_user=""
+            cpu_weight_system=""
             ;;
     esac
 
     # Scale CPU cores FIRST (activate all for BAL/PRF) before applying profile
     # This ensures the tlp command sees all available cores and applies the profile correctly
     scale_cpu_cores "$workload" "$profile"
+
+    # Set CPU weight for user.slice and system.slice
+    write_cpu_weight "$cpu_weight_user" "$cpu_weight_system"
   
     # Apply TLP profile via tlp command (with all cores now available)
     /usr/sbin/tlp "$tlp_profile" >/dev/null 2>&1 || true
@@ -2168,10 +2183,14 @@ cleanup_daemon() {
     if [ "$total_cores" -lt 1 ]; then
         return 0
     else
-        enable_cpuset_controller
+        enable_cgroup_controller
         echo "$cpu_mask" > "/sys/fs/cgroup/system.slice/cpuset.cpus" 2>/dev/null
         echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null
     fi
+    
+    # Reset CPU weight to default
+    enable_cgroup_controller
+    write_cpu_weight 100 100
 
     # Stop scx-p2dq
     stop_scx_p2dq
@@ -2405,14 +2424,6 @@ run_loop() {
     # Start with all CPU cores online until we have enough workload data
     scale_cpu_cores "$workload" "$profile"
     
-    # Check AC status immediately on startup (don't wait for first interval)
-    cached_ac_status=$(get_ac_power)
-    if [ "$cached_ac_status" = "1" ]; then
-        echo_debug "power-saver" "AC power detected on startup, stopping daemon"
-        scale_cpu_cores 0 "PRF"
-        exit 0
-    fi
-
     while [ "$shutdown" = false ]; do
         now=$(date +%s)
 
@@ -2425,7 +2436,7 @@ run_loop() {
         # Stop daemon on AC power
         if [ "$cached_ac_status" = "1" ]; then
             echo_debug "power-saver" "switched to AC mode, activating all CPU cores, stopping daemon"
-            scale_cpu_cores 0 "PRF"
+            cleanup_daemon
             exit 0
         fi
                 
@@ -2928,14 +2939,20 @@ if [ "$script_name" = "tlp-psd" ]; then
             remove_pidfile
             ;;
         run)
-            trap 'cleanup_daemon' EXIT TERM INT
             RUNDIR=/run/tlp
-            set_idle_governor
-            optimize_vm_parameters
-            enable_favordynmods
-            enable_cpuset_controller
-            start_scx_p2dq
-            run_loop
+            trap 'cleanup_daemon' EXIT TERM INT
+            # Check AC status immediately on startup (don't wait for first interval)
+            cached_ac_status=$(get_ac_power)
+            if [ "$cached_ac_status" = "1" ]; then
+                exit 0
+            else
+                set_idle_governor
+                optimize_vm_parameters
+                enable_favordynmods
+                enable_cgroup_controller
+                start_scx_p2dq
+                run_loop
+            fi
             ;;
         status)
             # Display daemon statistics (no root required)
