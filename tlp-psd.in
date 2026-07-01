@@ -2,7 +2,7 @@
 # tlp-psd - Workload-dependent profile switching (SAV/BAL/PRF)
 # Automatically switches between SAV, BAL, and PRF profiles based on workload.
 #
-# +++ 1.10.5 --- 20.06.2026 +++
+# +++ 1.10.5 --- 0.07.2026 +++
 #
 # Copyright (c) 2026 Mario Herrmann <marioherrmann at posteo.de>.
 # SPDX-License-Identifier: GPL-2.0-or-later
@@ -779,7 +779,7 @@ enable_cgroup_controller() {
     
     # Try to enable in root cgroup first (if supported)
     if [ -w "/sys/fs/cgroup/cgroup.subtree_control" ]; then
-        echo "+cpuset" > "/sys/fs/cgroup/cgroup.subtree_control" 2>/dev/null
+        echo "+cpuset +io" > "/sys/fs/cgroup/cgroup.subtree_control" 2>/dev/null
     fi
     
     # Then enable in process-specific cgroup
@@ -787,7 +787,7 @@ enable_cgroup_controller() {
     if [ -n "$cgroup_path" ] && [ "$cgroup_path" != "/" ]; then
         cgroup_dir="/sys/fs/cgroup${cgroup_path}"
         if [ -w "${cgroup_dir}/cgroup.subtree_control" ]; then
-            echo "+cpuset" > "${cgroup_dir}/cgroup.subtree_control" 2>/dev/null
+            echo "+cpuset +io" > "${cgroup_dir}/cgroup.subtree_control" 2>/dev/null
         fi
     fi
 }
@@ -861,7 +861,7 @@ scale_cpu_cores_sav() {
         
         # Read siblings list to identify primary vs secondary threads
         local siblings
-        siblings=$(cat "$siblings_file" 2>/dev/null | tr ',-' ' ')
+        siblings=$(cat < "$siblings_file" 2>/dev/null | tr ',-' ' ')
         
         # Extract first sibling (primary thread of this core)
         local first_sibling=""
@@ -968,6 +968,7 @@ scale_cpu_cores() {
 }
 
 write_cpu_weight() {
+    [ -x /usr/bin/systemctl ] || return 0
     # Set CPU weight for user.slice and system.slice via systemd
     # Parameters: $1 = user_weight (0-1000), $2 = system_weight (0-1000)
     local user_weight="${1:-100}"
@@ -975,12 +976,21 @@ write_cpu_weight() {
 
     enable_cgroup_controller  # Ensure cgroup controller is enabled before writing
     
-    if [ -x /usr/bin/systemctl ]; then
-        echo "$user_weight" > /sys/fs/cgroup/user.slice/cpu.weight 2>/dev/null
-        echo "$system_weight" > /sys/fs/cgroup/system.slice/cpu.weight 2>/dev/null
-    else
-        return 0
-    fi
+    echo "$user_weight" > /sys/fs/cgroup/user.slice/cpu.weight 2>/dev/null
+    echo "$system_weight" > /sys/fs/cgroup/system.slice/cpu.weight 2>/dev/null
+}
+
+write_io_weight() {
+    [ -x /usr/bin/systemctl ] || return 0
+    # Set IO weight for user.slice and system.slice via systemd
+    # Parameters: $1 = user_weight (0-1000), $2 = system_weight (0-1000)
+    local user_weight="${1:-100}"
+    local system_weight="${2:-100}"
+
+    enable_cgroup_controller  # Ensure cgroup controller is enabled before writing
+
+    echo "default $user_weight" > /sys/fs/cgroup/user.slice/io.weight 2>/dev/null
+    echo "default $system_weight" > /sys/fs/cgroup/system.slice/io.weight 2>/dev/null
 }
 
 get_ac_power() {
@@ -1045,24 +1055,32 @@ apply_profile() {
             pm_qos_constraint=100000  # 100ms: allow aggressive power saving
             cpu_weight_user=600  # Favor user processes more in SAV to improve responsiveness under heavy power saving (but still allow system processes to run)
             cpu_weight_system=400
+            io_weight_user=600  # Favor user processes more in SAV for better responsiveness
+            io_weight_system=400
             ;;
         BAL)
             tlp_profile="balanced"
             pm_qos_constraint=10000   # 10ms: moderate restrictions
             cpu_weight_user=500  # Equal weight for user and system processes in BAL for a balanced approach
             cpu_weight_system=500
+            io_weight_user=500  # Equal weight for user and system processes in BAL 
+            io_weight_system=500
             ;;
         PRF)
             tlp_profile="performance"
             pm_qos_constraint=100     # 100µs: strict latency, no deep idle
             cpu_weight_user=800  # Favor user processes more in PRF for maximum performance (but still allow system processes to run)
             cpu_weight_system=200
+            io_weight_user=800  # Favor user processes more in PRF for maximum performance
+            io_weight_system=200
             ;;
         *)
             tlp_profile="$profile"
             pm_qos_constraint=""
             cpu_weight_user=""
             cpu_weight_system=""
+            io_weight_user=""
+            io_weight_system=""
             ;;
     esac
 
@@ -1072,6 +1090,9 @@ apply_profile() {
 
     # Set CPU weight for user.slice and system.slice
     write_cpu_weight "$cpu_weight_user" "$cpu_weight_system"
+
+    # Set IO weight for user.slice and system.slice
+    write_io_weight "$io_weight_user" "$io_weight_system"
   
     # Apply TLP profile via tlp command (with all cores now available)
     /usr/sbin/tlp "$tlp_profile" >/dev/null 2>&1 || true
@@ -2188,9 +2209,10 @@ cleanup_daemon() {
         echo "$cpu_mask" > "/sys/fs/cgroup/user.slice/cpuset.cpus" 2>/dev/null
     fi
     
-    # Reset CPU weight to default
+    # Reset CPU and io weight to default
     enable_cgroup_controller
-    write_cpu_weight 100 100
+    write_cpu_weight
+    write_io_weight
 
     # Stop scx-p2dq
     stop_scx_p2dq
