@@ -1,7 +1,7 @@
 #!/bin/sh
 # tlp-func-rf - Radio Device Checks and PM Functions
 #
-# Copyright (c) 2026 Thomas Koch <linrunner at gmx.net> and others.
+# Copyright (c) 2025 Thomas Koch <linrunner at gmx.net> and others.
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Needs: tlp-func-base
@@ -24,11 +24,12 @@ get_wifi_ifaces () { # get all wifi devices -- retval: $_wifaces
 
     for wiu in "$NETD"/*/uevent; do
         if grep -q -s 'DEVTYPE=wlan' "$wiu" ; then
-            wi="${wiu%/uevent}"; wi="${wi##*/}"
-            _wifaces="${_wifaces}${_wifaces:+ }${wi}"
+            wi=${wiu%/uevent}; wi=${wi##*/}
+            _wifaces="$_wifaces $wi"
         fi
     done
 
+    _wifaces="${_wifaces# }"
     return 0
 }
 
@@ -68,13 +69,14 @@ any_wifi_in_use () { # check if any wifi device is in use
 
 # --- Wifi Power Management
 
-set_wifi_power_mode () { # set wifi power save mode -- $1: PP_PRF, PP_BAL, PP_SAV
+set_wifi_power_mode () { # set wifi power save mode -- $1: 0=ac mode, 1=battery mode
     local pwr iface
 
-    case "$1" in
-        "$PP_PRF")           pwr="${WIFI_PWR_ON_AC:-}" ;;
-        "$PP_BAL"|"$PP_SAV") pwr="${WIFI_PWR_ON_BAT:-}" ;;
-    esac
+    if [ "$1" = "1" ]; then
+        pwr=${WIFI_PWR_ON_BAT:-}
+    else
+        pwr=${WIFI_PWR_ON_AC:-}
+    fi
 
     # check values, translate obsolete syntax
     case "$pwr" in
@@ -120,11 +122,12 @@ get_wwan_ifaces () { # get all wwan devices -- retval: $_wanifaces
 
     for wiu in "$NETD"/*/uevent; do
         if grep -q -s 'DEVTYPE=wwan' "$wiu" ; then
-            wi="${wiu%/uevent}"; wi="${wi##*/}"
-            _wanifaces="${_wanifaces}${_wanifaces:+ }${wi}"
+            wi=${wiu%/uevent}; wi=${wi##*/}
+            _wanifaces="$_wanifaces $wi"
         fi
     done
 
+    _wanifaces="${_wanifaces# }"
     return 0
 }
 
@@ -195,13 +198,6 @@ any_bluetooth_in_use () { # check if any bluetooth interface is in use
     for i in $_bifaces; do
         bluetooth_in_use "$i" && return 0
     done
-
-    return 1
-}
-
-# --- NFC Device Checks
-
-any_nfc_in_use () { # always consider nfc *not* in use
 
     return 1
 }

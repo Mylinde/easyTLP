@@ -53,7 +53,6 @@ case $self in
                 ;;
 
             "")
-                get_rf_dev_state "$self"
                 echo_device_state "$self" "$_devs"
                 ;;
 
