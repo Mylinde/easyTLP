@@ -10,91 +10,11 @@ This creates a system that is both **predictive** (AI-based pattern recognition)
 
 ---
 
-## Functional Schema 1: Dual-Stage Switching Architecture
+## Functional Schema: Dual-Stage Switching Architecture
 
-```mermaid
-graph TB
-    Start["Daemon Startup (cycle)"] --> Collect["Collect Metrics<br/>(CPU, I/O, Load)"]
-    
-    Collect --> LagScore["Calculate Lag Score (0-100)<br/>CPU Util + I/O Wait + Load Avg"]
-    LagScore --> ACCheck["AC Status Check"]
-    ACCheck -->|"AC Power"| Stop["Stop Daemon<br/>Activate all cores"]
-    ACCheck -->|"Battery"| BufferAdd["Add to switch_buf<br/>(comma-separated scores)"]
-    
-    BufferAdd --> Stage1{"STAGE 1<br/>Proactive Pattern<br/>Matching"}
-    
-    Stage1 -->|"4+ scores &<br/>Patterns exist"| CheckPatterns["Compare switch_buf<br/>vs permanent patterns<br/>(±3 tolerance)"]
-    Stage1 -->|"No patterns yet<br/>or <4 scores"| Stage2Start["→ Skip to STAGE 2"]
-    
-    CheckPatterns -->|"Match ≥70%<br/>HITS≥2"| ProactiveSwitch["PROACTIVE DECISION<br/>Apply profile immediately"]
-    CheckPatterns -->|"No match<br/>or low confidence"| Stage2Start
-    
-    ProactiveSwitch --> ApplyProActive["apply_profile()<br/>set_pm_qos_constraints()<br/>scale_cpu_cores()"]
-    ApplyProActive --> LogProactive["Log: PROACTIVE SWITCH<br/>Pattern #X matched"]
-    LogProactive --> SkipStage2["Set: proactive_matched=1<br/>Skip STAGE 2"]
-    
-    SkipStage2 --> NextCycle["Wait <br/>Next cycle"]
-    
-    Stage2Start --> Stage2{"STAGE 2<br/>Threshold-Based<br/>Fallback"}
-    Stage2 -->|"proactive_matched=0"| CalcThresholds["Calculate Adaptive<br/>Thresholds<br/>(low=avg-offset, high=avg+offset)"]
-    
-    CalcThresholds --> DetermineProfile["Determine Target<br/>Profile: SAV/BAL/PRF"]
-    DetermineProfile --> CheckBattery["Check Battery < 20%<br/>(cap at BAL)"]
-    CheckBattery --> MaySwitch{"Profile != Current<br/>& conditions met?"}
-    
-    MaySwitch -->|"Yes, switch"| ApplyThreshold["apply_profile()<br/>set_pm_qos_constraints()<br/>scale_cpu_cores()"]
-    MaySwitch -->|"No, stay"| StayProfile["Keep current profile"]
-    
-    ApplyThreshold --> PatternCapture["Capture 10-sample<br/>sequence from switch_buf"]
-    StayProfile --> PatternCapture
-    
-    PatternCapture --> CheckCandidates["check_and_manage_candidates()"]
-    CheckCandidates -->|"1st time"| SaveCandidate["Save as CANDIDATE<br/>to /var/lib/tlp/<br/>candidates.conf"]
-    CheckCandidates -->|"2nd occurrence<br/>≥70% match"| PromotePattern["PROMOTE to PERMANENT<br/>HIT_PATTERN_X<br/>(HITS=2)"]
-    CheckCandidates -->|"No pattern"| NoPattern["→ Continue"]
-    
-    SaveCandidate --> NoPattern
-    PromotePattern --> NoPattern
-    
-    NoPattern --> NextCycle
-    
-    NextCycle -.->|"Every <br/>Adaptive interval"| LearnCycle["LEARNING CYCLE"]
-    
-    subgraph Learn["LEARNING CYCLE (Adaptive Frequency)"]
-        L1["1 EVALUATE"]
-        L1 -->|"Compare prediction<br/>vs actual load"| L2["Update TREND_CONFIDENCE<br/>+5% if correct / -10% if wrong"]
-        
-        L2 --> L3["2 CALCULATE"]
-        L3 -->|"Analyze <br/>history distribution"| L4["Compute optimal_low<br/>& optimal_offset"]
-        
-        L4 --> L5["3 PREDICT"]
-        L5 -->|"Is trend<br/>stable?"| L5a["STABLE_MODE<br/>(±3 range)<br/>predicted = current"]
-        L5 -->|"Is trend<br/>changing?"| L5b["TREND_MODE<br/>(>±3)<br/>predicted = current<br/>+ trend×confidence%"]
-        
-        L5a --> L6["4 ADAPT INTERVAL<br/>(based on<br/>TREND_CONFIDENCE)"]
-        L5b --> L6
-        
-        L6 --> L7["5 SAVE STATE<br/>to /var/lib/tlp/<br/>psd-state.conf"]
-        L7 --> L8["✓ Resume loop"]
-    end
-    
-    LearnCycle --> L8
-    L8 -.->|"Next cycle"| NextCycle
-    
-    style Stage1 fill:#FFB6C1
-    style ProactiveSwitch fill:#FFD700
-    style LogProactive fill:#FFD700
-    style Stage2 fill:#87CEEB
-    style CalcThresholds fill:#87CEEB
-    style PatternCapture fill:#90EE90
-    style Learn fill:#DDA0DD
-```
+![alt text](daemon_complete_workflow.svg)
 
----
-
-## Stage 1: Proactive Pattern Matching
-
-### Pattern Learning for All Profiles
+## Pattern Learning for All Profiles
 
 The daemon learns and stores workload patterns for **all three profiles (SAV, BAL, and PRF)**:
 

@@ -20,7 +20,7 @@ Unlike simple heuristic approaches, **tlp-psd implements a self-correcting predi
 
 Key improvement: **Zero manual configuration needed**. The daemon understands your workload better than any static configuration ever could.
 
-For detailed information, see `README-POWER-SAVER.md <README-POWER-SAVER.md>`_.
+For detailed information, see `README-POWER-SAVER-DAEMON.md <README-POWER-SAVER-DAEMON.md>`_.
 
 **Status**: Production-ready. Tested with various workloads (office, development, heavy computation).
 
