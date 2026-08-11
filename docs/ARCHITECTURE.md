@@ -1,4 +1,4 @@
-# TLP Power Saver Daemon: Complete Architecture (v1.10.2)
+# TLP Power Saver Daemon: Complete Architecture (v1.10.5)
 
 ## Overview: Dual-Stage Intelligent Switching Architecture
 
