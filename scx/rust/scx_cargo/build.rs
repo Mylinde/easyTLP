@@ -11,17 +11,14 @@ const BPF_H: &str = "bpf_h";
 
 fn gen_bpf_h() {
     let out_dir = env::var("OUT_DIR").unwrap();
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let bpf_h_path = PathBuf::from(&manifest_dir).join(BPF_H);
     let file = File::create(PathBuf::from(&out_dir).join(format!("{BPF_H}.tar"))).unwrap();
     let mut ar = tar::Builder::new(file);
 
     ar.follow_symlinks(false);
-    ar.append_dir_all(".", &bpf_h_path).unwrap();
+    ar.append_dir_all(".", BPF_H).unwrap();
 
     let vmlinux_dir = tempfile::tempdir().unwrap();
-    let vmlinux_path = PathBuf::from(&manifest_dir).join("vmlinux.tar.zst");
-    let mut vmlinux_tar_zst = File::open(&vmlinux_path).unwrap();
+    let mut vmlinux_tar_zst = File::open("vmlinux.tar.zst").unwrap();
     let vmlinux_tar = ruzstd::decoding::StreamingDecoder::new(&mut vmlinux_tar_zst).unwrap();
     tar::Archive::new(vmlinux_tar)
         .unpack(vmlinux_dir.path())
@@ -31,7 +28,7 @@ fn gen_bpf_h() {
 
     ar.finish().unwrap();
 
-    for ent in walkdir::WalkDir::new(&bpf_h_path) {
+    for ent in walkdir::WalkDir::new(BPF_H) {
         let ent = ent.unwrap();
         if !ent.file_type().is_dir() {
             println!("cargo:rerun-if-changed={}", ent.path().to_string_lossy());

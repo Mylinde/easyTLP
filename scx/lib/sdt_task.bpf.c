@@ -5,7 +5,6 @@
  * Copyright (c) 2024 Emil Tsalapatis <etsal@meta.com>
  */
 
-#include "scxtest/scx_test.h"
 #include <scx/common.bpf.h>
 #include <lib/alloc/bpf_helpers_local.h>
 #include <lib/sdt_task.h>
@@ -38,13 +37,13 @@ void __arena *scx_task_alloc(struct task_struct *p)
 	mval = bpf_task_storage_get(&scx_task_map, p, 0,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!mval) {
-		scx_err_loc("bpf_task_storage_get failed");
+		scx_bpf_error("bpf_task_storage_get failed");
 		return NULL;
 	}
 
 	data = scx_alloc(&scx_task_allocator);
 	if (unlikely(!data)) {
-		scx_err_loc("scx_alloc failed");
+		scx_bpf_error("scx_alloc failed");
 		return NULL;
 	}
 

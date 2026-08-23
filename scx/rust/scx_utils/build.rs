@@ -12,12 +12,10 @@ use scx_cargo::ClangInfo;
 
 fn gen_bindings() {
     let out_dir = env::var("OUT_DIR").unwrap();
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let clang = ClangInfo::new().unwrap();
     let kernel_target = clang.kernel_target().unwrap();
 
-    let vmlinux_path = PathBuf::from(&manifest_dir).join("vmlinux.tar.zst");
-    let mut vmlinux_tar_zst = File::open(&vmlinux_path).unwrap();
+    let mut vmlinux_tar_zst = File::open("vmlinux.tar.zst").unwrap();
 
     let mut vmlinux_h = String::new();
 

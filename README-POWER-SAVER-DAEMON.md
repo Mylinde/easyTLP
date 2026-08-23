@@ -26,7 +26,7 @@ A lightweight, intelligent, self-learning daemon that automatically switches bet
 
 ### Integration: scx_p2dq Kernel Scheduler
 
-**tlp-psd includes the eBPF-based scx_p2dq scheduler 1.1.1** for adaptive kernel-level workload balancing.
+**tlp-psd includes the eBPF-based scx_p2dq scheduler 1.1.3** for adaptive kernel-level workload balancing.
 
 #### What is scx_p2dq?
 scx_p2dq is a modern **eBPF-based CPU scheduler** (using Linux's sched_ext framework) that intelligently manages per-core task scheduling. Unlike the default CFS (Completely Fair Scheduler), p2dq makes real-time decisions about which task runs on which core, optimizing for:

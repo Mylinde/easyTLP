@@ -14,7 +14,7 @@ The daemon:
   • **Survives reboots** with persistent state management
   • Switches dynamically between SAV, BAL, and PRF profiles
   • Runs on battery power only (auto-stops on AC)
-  • **Integrates scx_p2dq scheduler 1.1.1** for adaptive kernel-level workload balancing
+  • **Integrates scx_p2dq scheduler 1.1.3** for adaptive kernel-level workload balancing
 
 Unlike simple heuristic approaches, **tlp-psd implements a self-correcting predictive system** that continuously improves its accuracy. The daemon is **zero-configuration** — it automatically optimizes for your specific system and usage patterns.
 
