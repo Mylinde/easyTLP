@@ -350,7 +350,8 @@ restore_device_states () { # restore radio type states
 }
 
 set_radio_device_states () { # set/initialize all radio states
-    # $1: start/stop/1/0/radiosw
+    # $1: start/stop/1/0/2/radiosw
+    #     0=AC or PP_PRF(performance), 1=BAT or PP_BAL(balanced), 2=PP_SAV(power-saver)
     # called from init scripts or upon change of power source
     local dev devs2disable devs2enable restore
     local quiet=0
@@ -423,7 +424,7 @@ set_radio_device_states () { # set/initialize all radio states
                 fi
                 ;;
 
-            1) # battery power --> build disable list
+            1|2) # battery power (1) or power-saver profile (2) --> build disable list
                 quiet=1 # do not display progress
                 devs2enable=""
                 devs2disable="${DEVICES_TO_DISABLE_ON_BAT:-}"

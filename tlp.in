@@ -345,7 +345,7 @@ case "$_cmd" in
                 # even if profile hasn't changed, still check radio devices on AC/BAT switch
                 # (check if power source changed while keeping same profile)
                 if [ "$_syspwr" != "$_ps_last" ]; then
-                    set_radio_device_states "$_pp_next"
+                    set_radio_device_states "$_syspwr"
                 fi
             fi
             # shellcheck disable=SC2154
