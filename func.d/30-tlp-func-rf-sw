@@ -386,6 +386,21 @@ set_radio_device_states () { # set/initialize all radio states
             start) # system startup
                 devs2disable="$DEVICES_TO_DISABLE_ON_STARTUP"
                 devs2enable="$DEVICES_TO_ENABLE_ON_STARTUP"
+
+                # also check configured list for devices not in use on battery
+                # but only if system is running on battery power
+                if [ "$_syspwr" = "$PS_BAT" ]; then
+                    for dev in ${DEVICES_TO_DISABLE_ON_BAT_NOT_IN_USE:-}; do
+                        # if device is not in use and not already in list --> add to disable list
+                        { case $dev in
+                            bluetooth) any_bluetooth_in_use ;;
+                            wifi) any_wifi_in_use ;;
+                            wwan) any_wwan_in_use ;;
+                            *) false ;;   # unknown radio device
+                        esac } || wordinlist "$dev" "$devs2disable" || devs2disable="$dev $devs2disable"
+                    done
+                    devs2disable="${devs2disable# }"
+                fi
                 ;;
 
             stop) # system shutdown
@@ -420,6 +435,7 @@ set_radio_device_states () { # set/initialize all radio states
                         bluetooth) any_bluetooth_in_use ;;
                         wifi) any_wifi_in_use ;;
                         wwan) any_wwan_in_use ;;
+                        *) false ;;   # unknown radio device
                     esac } || wordinlist "$dev" "$devs2disable" || devs2disable="$dev $devs2disable"
                 done
                 devs2disable="${devs2disable# }"

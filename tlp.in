@@ -338,8 +338,15 @@ case "$_cmd" in
             if has_power_profile_changed; then
                 apply_common_settings "$_pp_next"
                 poweroff_drivebay "$_pp_next" 0
-                set_radio_device_states "$_pp_next"
                 save_runconf
+                # apply radio device state changes when profile changes
+                set_radio_device_states "$_pp_next"
+            else
+                # even if profile hasn't changed, still check radio devices on AC/BAT switch
+                # (check if power source changed while keeping same profile)
+                if [ "$_syspwr" != "$_ps_last" ]; then
+                    set_radio_device_states "$_pp_next"
+                fi
             fi
             # shellcheck disable=SC2154
             if [ "$RESTORE_THRESHOLDS_ON_BAT" = "1" ] \
