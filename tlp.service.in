@@ -12,7 +12,7 @@ Wants=tlp-psd.service
 Documentation=https://linrunner.de/tlp
 
 [Service]
-Type=oneshot
+Type=simple
 RemainAfterExit=yes
 ExecStart=@TLP_SBIN@/tlp init start
 ExecReload=@TLP_SBIN@/tlp start
