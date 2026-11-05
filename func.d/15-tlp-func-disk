@@ -621,11 +621,12 @@ set_laptopmode () {
     # set kernel laptop mode
     # $1: PP_PRF, PP_BAL, PP_SAV
 
-    local isec
+    local isec rc
 
+    # note: won't add _SAV here, since laptop_mode is already removed in kernel >= 7.0
     case "$1" in
-        "$PP_PRF")           isec="${DISK_IDLE_SECS_ON_AC:-}" ;;
-        "$PP_BAL"|"$PP_SAV") isec="${DISK_IDLE_SECS_ON_BAT:-}" ;;
+        "$PP_PRF")           isec="${DISK_IDLE_SECS_ON_PRF:-}" ;;
+        "$PP_BAL"|"$PP_SAV") isec="${DISK_IDLE_SECS_ON_BAL:-}" ;;
     esac
 
     # replace with empty string if non-numeric chars are contained
@@ -637,9 +638,18 @@ set_laptopmode () {
         return 0
     fi
 
-    [ -f /proc/sys/vm/laptop_mode ] || return 0
-    write_sysf "$isec" /proc/sys/vm/laptop_mode
-    echo_debug "disk" "set_laptopmode($1): $isec; rc=$?"
+    if [ ! -f /proc/sys/vm/laptop_mode ]; then
+        echo_debug "disk" "set_laptopmode($1).non_existent" "$LOG_INFO"
+        return 0
+    fi
+    if kernel_version_ge "$LM_IGN_KVER"; then
+        # prevent "vm.laptop_mode is deprecated" warnings
+        echo_debug "disk" "set_laptopmode($1).ignored" "$LOG_INFO"
+        return 0
+    fi
+
+    write_sysf "$isec" /proc/sys/vm/laptop_mode; rc=$?
+    echo_debug "disk" "set_laptopmode($1): $isec; rc=$rc" "$(rc2log "$rc")"
 
     return 0
 }
