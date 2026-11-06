@@ -359,13 +359,7 @@ case "$_cmd" in
                 if ! lockpeek_tlp tlp_discharge; then
                     init_batteries_thresholds
                 fi
-            fi
-            # power-saver-daemon: start or stop based on configuration
-            if [ "${POWER_SAVER_ENABLE}" = "1" ]; then
-                systemctl start tlp-psd 2>/dev/null || true
-            else
-                systemctl stop tlp-psd 2>/dev/null || true
-            fi            
+            fi          
             unlock_tlp
         fi
         ;;
@@ -402,12 +396,6 @@ case "$_cmd" in
             [ "$X_TLP_USB_MODE" = "1" ] && set_usb_suspend 0 auto
             set_radio_device_states "$_pp_next"
             save_runconf
-
-            # stop power-saver-daemon if POWER_SAVER_ENABLE=1 and new profile is not power-saver
-            if [ "$POWER_SAVER_ENABLE" = "1" ] && [ "$_cmd" != "power-saver" ]; then
-                systemctl stop tlp-psd 2>/dev/null || true
-            fi
-
             echo_started_profile "$_pp_next"
         else
             echo_tlp_locked
