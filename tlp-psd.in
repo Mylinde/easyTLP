@@ -554,9 +554,10 @@ start_scx_p2dq() {
         return 1
     fi
 
-    # Start scheduler with the appropriate flags
+    # Start scheduler directly without shell re-parsing.
     # shellcheck disable=SC2086
-    if /bin/bash -c 'exec scx_p2dq $p2dq_flags ' 2>/dev/null &
+    set -- $p2dq_flags
+    if scx_p2dq "$@" 2>/dev/null &
     then
         echo "$!" > "$RUNDIR/scx_p2dq.pid" 2>/dev/null || true
         return 0
@@ -609,6 +610,47 @@ check_scx_p2dq_health() {
         rm -f "$scx_pidfile" 2>/dev/null || true
         return 1
     fi
+}
+
+is_valid_profile_name() {
+    case "$1" in
+        SAV|BAL|PRF) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_valid_pattern_index() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) [ "$1" -gt 0 ] 2>/dev/null ;;
+    esac
+}
+
+is_valid_score_sequence() {
+    local seq="$1"
+    local old_ifs score
+
+    case "$seq" in
+        ''|*[!0-9,]*|,*|*,|*,,*) return 1 ;;
+    esac
+
+    old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086
+    set -- $seq
+    IFS="$old_ifs"
+
+    [ "$#" -gt 0 ] || return 1
+
+    for score in "$@"; do
+        case "$score" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$score" -ge 0 ] 2>/dev/null || return 1
+        [ "$score" -le 100 ] 2>/dev/null || return 1
+    done
+
+    return 0
 }
 
 set_pm_qos_constraints() {
@@ -1517,6 +1559,14 @@ EOF
                 # Dynamic fallbacks for data consistency
                 [ -z "$hits" ] && hits=0
                 [ -z "$pattern_num" ] && continue
+
+                # Strict validation of persisted pattern data before eval.
+                is_valid_pattern_index "$pattern_num" || continue
+                is_valid_score_sequence "$scores" || continue
+                is_valid_profile_name "$profile" || continue
+                case "$hits" in
+                    ''|*[!0-9]*) hits=0 ;;
+                esac
                 
                 # Assign values dynamically to global runtime workspace variables
                 eval "hit_pattern_${pattern_num}_scores='$scores'"
@@ -1634,6 +1684,12 @@ save_candidates() {
     if [ -z "$sequence_to_save" ]; then
         return 0
     fi
+
+    local sequence_part profile_part
+    sequence_part="${sequence_to_save%:*}"
+    profile_part="${sequence_to_save#*:}"
+    is_valid_score_sequence "$sequence_part" || return 0
+    is_valid_profile_name "$profile_part" || return 0
     
     # Update in-memory cache first (ensures consistency across function calls without needing to read from disk)
     if [ -z "$candidates_cache" ]; then
@@ -1657,6 +1713,8 @@ check_and_manage_candidates() {
     
     local current_profile="$1"      # The profile we just switched to (SAV/BAL/PRF)
     local switch_sequence="$2"      # The lag sequence that triggered this switch
+
+    is_valid_profile_name "$current_profile" || return
     
     if [ -z "$switch_sequence" ]; then
         # No sequence provided (e.g., startup), skip
@@ -1722,6 +1780,10 @@ check_and_manage_candidates() {
             # Parse SEQUENCE:PROFILE format
             candidate_sequence="${candidate_line%:*}"
             candidate_profile="${candidate_line#*:}"
+
+            # Ignore malformed candidate entries from disk/cache.
+            is_valid_score_sequence "$candidate_sequence" || continue
+            is_valid_profile_name "$candidate_profile" || continue
             
             # Only match candidates for the same target profile
             if [ "$candidate_profile" != "$current_profile" ]; then
@@ -1754,6 +1816,9 @@ EOF
                 # Parse candidate: SEQUENCE:PROFILE
                 candidate_sequence="${candidate_line%:*}"
                 candidate_profile="${candidate_line#*:}"
+
+                is_valid_score_sequence "$candidate_sequence" || continue
+                is_valid_profile_name "$candidate_profile" || continue
                 
                 # Only compare same profile
                 if [ "$candidate_profile" = "$current_profile" ]; then
@@ -1870,6 +1935,15 @@ promote_candidate_to_permanent() {
         echo_debug "power-saver" "ERROR: promote requires sequence and profile"
         return 1
     fi
+
+    is_valid_score_sequence "$sequence" || {
+        echo_debug "power-saver" "ERROR: invalid score sequence in promote"
+        return 1
+    }
+    is_valid_profile_name "$profile" || {
+        echo_debug "power-saver" "ERROR: invalid profile in promote"
+        return 1
+    }
     
     # Check if this exact sequence already exists in cache
     if echo "$psd_state_cache" | grep -q "HIT_PATTERN_.*_SCORES='$sequence'" 2>/dev/null; then
