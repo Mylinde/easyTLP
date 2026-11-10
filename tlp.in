@@ -359,7 +359,13 @@ case "$_cmd" in
                 if ! lockpeek_tlp tlp_discharge; then
                     init_batteries_thresholds
                 fi
-            fi          
+            fi
+           	# start power-saver-daemon if POWER_SAVER_ENABLE=1
+            if [ "$POWER_SAVER_ENABLE" = "1" ]; then
+                if ! systemctl is-active --quiet tlp-psd 2>/dev/null; then
+                	systemctl start tlp-psd 2>/dev/null || true
+                fi
+			fi          
             unlock_tlp
         fi
         ;;
@@ -400,13 +406,9 @@ case "$_cmd" in
             # start power-saver-daemon if POWER_SAVER_ENABLE=1
             if [ "$POWER_SAVER_ENABLE" = "1" ]; then
                 if ! systemctl is-active --quiet tlp-psd 2>/dev/null; then
-                    systemctl start tlp-psd 2>/dev/null || true
+                	systemctl start tlp-psd 2>/dev/null || true
                 fi
-            else
-                if systemctl is-active --quiet tlp-psd 2>/dev/null; then
-                    systemctl stop tlp-psd 2>/dev/null || true
-                fi
-            fi
+			fi
         else
             echo_tlp_locked
         fi
